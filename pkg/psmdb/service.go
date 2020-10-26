@@ -59,7 +59,7 @@ const ExternalDnsAnnotation = "external-dns.alpha.kubernetes.io/hostname"
 
 // ExternalService returns a Service object needs to serve external connections
 func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podName string) *corev1.Service {
-	log.Info("Creating service with podName %s", podName)
+	log.Info(fmt.Sprintf("Creating service with podName %s", podName))
 	svc := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Service",
@@ -80,12 +80,12 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 
 
 	if svc.ObjectMeta.Annotations[ExternalDnsAnnotation] != "" {
-		log.Info("ExternalDnsAnnotation not empty, got %s", svc.ObjectMeta.Annotations[ExternalDnsAnnotation])
+		log.Info(fmt.Sprintf("ExternalDnsAnnotation not empty, got %s", svc.ObjectMeta.Annotations[ExternalDnsAnnotation]))
 		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = ""
 	}
 	if m.Spec.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
 		serviceAddress := fmt.Sprintf("%s.%s", podName, m.Spec.ExternalDnsZone)
-		log.Info("Creating service annotation with serviceAddress %s", serviceAddress)
+		log.Info(fmt.Sprintf("Creating service annotation with serviceAddress %s", serviceAddress))
 		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = serviceAddress
 	}
 
