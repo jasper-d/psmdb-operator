@@ -65,6 +65,7 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: m.Namespace,
+			Annotations: m.Spec.Mongod.ServiceAnnotations,
 		},
 	}
 
@@ -89,6 +90,7 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 				TargetPort: intstr.FromInt(int(m.Spec.Mongod.Net.Port)),
 			},
 		},
+		LoadBalancerSourceRanges: m.Spec.Mongod.LoadBalancerSourceRanges,
 		Selector: map[string]string{"statefulset.kubernetes.io/pod-name": podName},
 	}
 
