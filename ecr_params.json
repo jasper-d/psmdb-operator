@@ -1,0 +1,10 @@
+[
+    {
+    "ParameterKey": "ListOfPrincipalIds",
+    "ParameterValue": "arn:aws:iam::513671337102:root,arn:aws:iam::601401576498:root,arn:aws:iam::017177459595:root"
+    },
+    {
+    "ParameterKey": "RepositoryName",
+    "ParameterValue": "percona-server-mongodb-operator"
+    }
+  ]

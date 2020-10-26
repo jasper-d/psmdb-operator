@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ECR Repository
+
+Parameters:
+  ListOfPrincipalIds:
+    Type: String
+    Description: List of Principal IDs (e.g. arn:aws:iam::ACCOUNT_NUMBER:root) which should be allowed to pull the Docker images
+
+  RepositoryName:
+    Type: String
+    Description: Name of the ECR repository to create
+Resources:
+
+  BaseRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryPolicyText:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowCrossAccountPull
+            Effect: Allow
+            Principal:
+              AWS: !Split [",", !Ref ListOfPrincipalIds]
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+            {
+              "rulePriority": 3,
+              "description": "Keep only 10 Images tagged with git-",
+              "selection": {
+                "countType": "imageCountMoreThan",
+                "countNumber": 15,
+                "tagStatus": "tagged",
+                "tagPrefixList": [
+                  "git-"
+                ]
+              },
+              "action": {
+                "type": "expire"
+              }
+            },
+            {
+              "rulePriority": 4,
+              "description": "Remove untagged images",
+              "selection": {
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "countNumber": 1
+              },
+              "action": {
+                "type": "expire"
+              }
+            }
+            ]
+          }
+

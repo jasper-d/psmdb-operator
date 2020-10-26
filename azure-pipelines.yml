@@ -1,0 +1,56 @@
+trigger:
+- master
+
+pool: 'DefaultLinux'
+
+steps:
+- bash: |
+    docker build -f ./build/Dockerfile -t harbor.internal.datahub-sts.de/infrastructure/percona-server-mongodb-operator:git-$(Build.SourceVersion) .
+    docker image ls
+  displayName: docker build
+
+- task: CloudFormationCreateOrUpdateStack@1
+  displayName: Create ECR Registry
+  inputs:
+    awsCredentials: deployment-shared-services
+    regionName: eu-central-1
+    stackName: ecr-percona-server-mongodb-operator
+    templateSource: file
+    templateFile: ./ecr.yml
+    templateParametersFile: ./ecr_params.json
+
+- task: ECRPushImage@1
+  displayName: Push to ECR
+  continueOnError: true
+  inputs:
+    awsCredentials: deployment-shared-services
+    regionName: eu-central-1
+    imageSource: imagename
+    sourceImageName: harbor.internal.datahub-sts.de/infrastructure/percona-server-mongodb-operator
+    sourceImageTag: git-$(Build.SourceVersion)
+    repositoryName: percona-server-mongodb-operator
+    pushTag: git-$(Build.SourceVersion)
+    autoCreateRepository: false
+    logRequest: true
+    logResponse: true
+
+- task: Docker@2
+  displayName: Harbor login
+  inputs:
+    containerRegistry: harbor.internal.datahub-sts.de/infrastructure
+    command: login
+
+- task: Docker@2
+  displayName: Harbor push
+  inputs:
+    containerRegistry: harbor.internal.datahub-sts.de/infrastructure
+    repository: infrastructure/percona-server-mongodb-operator
+    command: push
+    tags: |
+      git-$(Build.SourceVersion)
+
+- task: Docker@2
+  displayName: Harbor logout
+  inputs:
+    containerRegistry: harbor.internal.datahub-sts.de/infrastructure
+    command: logout
