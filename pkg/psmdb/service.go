@@ -3,6 +3,7 @@ package psmdb
 import (
 	"context"
 	"fmt"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	"github.com/pkg/errors"
 )
+var log = logf.Log.WithName("service")
 
 // Service returns a core/v1 API Service
 func Service(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec) *corev1.Service {
@@ -57,6 +59,7 @@ const ExternalDnsAnnotation = "external-dns.alpha.kubernetes.io/hostname"
 
 // ExternalService returns a Service object needs to serve external connections
 func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podName string) *corev1.Service {
+	log.Info("Creating service with podName %s", podName)
 	svc := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Service",
@@ -65,12 +68,25 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: m.Namespace,
-			Annotations: m.Spec.Mongod.ServiceAnnotations,
+			Annotations: map[string]string{},
 		},
 	}
 
+	if len(m.Spec.Mongod.ServiceAnnotations) > 0 {
+		for k, v := range m.Spec.Mongod.ServiceAnnotations {
+			svc.ObjectMeta.Annotations[k] = v
+		}
+	}
+
+
+	if svc.ObjectMeta.Annotations[ExternalDnsAnnotation] != "" {
+		log.Info("ExternalDnsAnnotation not empty, got %s", svc.ObjectMeta.Annotations[ExternalDnsAnnotation])
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = ""
+	}
 	if m.Spec.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
-		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = fmt.Sprintf("%s.%s", podName, m.Spec.ExternalDnsZone)
+		serviceAddress := fmt.Sprintf("%s.%s", podName, m.Spec.ExternalDnsZone)
+		log.Info("Creating service annotation with serviceAddress %s", serviceAddress)
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = serviceAddress
 	}
 
 	svc.Labels = map[string]string{
