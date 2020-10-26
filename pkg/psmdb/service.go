@@ -68,8 +68,8 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 		},
 	}
 
-	if m.Spec.Mongod.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
-		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = fmt.Sprintf("%s.%s", podName, m.Spec.Mongod.ExternalDnsZone)
+	if m.Spec.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = fmt.Sprintf("%s.%s", podName, m.Spec.ExternalDnsZone)
 	}
 
 	svc.Labels = map[string]string{
