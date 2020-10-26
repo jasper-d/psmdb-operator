@@ -261,6 +261,7 @@ type MongodSpec struct {
 	Storage                  *MongodSpecStorage            `json:"storage,omitempty"`
 	LoadBalancerSourceRanges []string                      `json:"loadBalancerSourceRanges,omitempty"`
 	ServiceAnnotations       map[string]string             `json:"serviceAnnotations,omitempty"`
+	ExternalDnsZone          string                        `json:"externalDnsZone,omitempty"`
 }
 
 type MongodSpecNet struct {

@@ -53,6 +53,8 @@ func Service(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec) *corev1.Serv
 	}
 }
 
+const ExternalDnsAnnotation = "external-dns.alpha.kubernetes.io/hostname"
+
 // ExternalService returns a Service object needs to serve external connections
 func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podName string) *corev1.Service {
 	svc := &corev1.Service{
@@ -64,6 +66,10 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 			Name:      podName,
 			Namespace: m.Namespace,
 		},
+	}
+
+	if m.Spec.Mongod.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = fmt.Sprintf("%s.%s", podName, m.Spec.Mongod.ExternalDnsZone)
 	}
 
 	svc.Labels = map[string]string{
@@ -123,7 +129,13 @@ func GetServiceAddr(svc corev1.Service, pod corev1.Pod, cl client.Client) (*Serv
 		}
 
 	case corev1.ServiceTypeLoadBalancer:
-		host, err := getIngressPoint(pod, cl)
+		var err error
+		var host string
+		if svc.Annotations[ExternalDnsAnnotation] != "" {
+			host = svc.Annotations[ExternalDnsAnnotation]
+		} else {
+			host, err = getIngressPoint(pod, cl)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -215,6 +227,7 @@ func getExtAddr(cl client.Client, namespace string, pod corev1.Pod) (string, err
 	if err != nil {
 		return "", fmt.Errorf("fetch service address: %v", err)
 	}
+
 
 	hostname, err := GetServiceAddr(*svc, pod, cl)
 	if err != nil {
