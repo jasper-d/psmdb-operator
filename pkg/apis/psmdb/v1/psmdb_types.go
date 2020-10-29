@@ -190,6 +190,7 @@ type ReplsetSpec struct {
 	Arbiter                  Arbiter                    `json:"arbiter,omitempty"`
 	Expose                   Expose                     `json:"expose,omitempty"`
 	VolumeSpec               *VolumeSpec                `json:"volumeSpec,omitempty"`
+	DisableReadinessProbe    bool                       `json:"disableReadinessProbe,omitempty"`
 	ReadinessProbe           *corev1.Probe              `json:"readinessProbe,omitempty"`
 	LivenessProbe            *LivenessProbeExtended     `json:"livenessProbe,omitempty"`
 	PodSecurityContext       *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`

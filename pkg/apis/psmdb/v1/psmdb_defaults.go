@@ -177,26 +177,30 @@ func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log
 				startupDelaySecondsFlag, strconv.Itoa(replset.LivenessProbe.StartupDelaySeconds))
 		}
 
-		if replset.ReadinessProbe == nil {
-			replset.ReadinessProbe = &corev1.Probe{
-				Handler: corev1.Handler{
-					TCPSocket: &corev1.TCPSocketAction{
-						Port: intstr.FromInt(int(cr.Spec.Mongod.Net.Port)),
+		if !replset.DisableReadinessProbe {
+			if replset.ReadinessProbe == nil {
+				replset.ReadinessProbe = &corev1.Probe{
+					Handler: corev1.Handler{
+						TCPSocket: &corev1.TCPSocketAction{
+							Port: intstr.FromInt(int(cr.Spec.Mongod.Net.Port)),
+						},
 					},
-				},
+				}
 			}
-		}
-		if replset.ReadinessProbe.InitialDelaySeconds == 0 {
-			replset.ReadinessProbe.InitialDelaySeconds = int32(10)
-		}
-		if replset.ReadinessProbe.TimeoutSeconds == 0 {
-			replset.ReadinessProbe.TimeoutSeconds = int32(2)
-		}
-		if replset.ReadinessProbe.PeriodSeconds == 0 {
-			replset.ReadinessProbe.PeriodSeconds = int32(3)
-		}
-		if replset.ReadinessProbe.FailureThreshold == 0 {
-			replset.ReadinessProbe.FailureThreshold = int32(8)
+			if replset.ReadinessProbe.InitialDelaySeconds == 0 {
+				replset.ReadinessProbe.InitialDelaySeconds = int32(10)
+			}
+			if replset.ReadinessProbe.TimeoutSeconds == 0 {
+				replset.ReadinessProbe.TimeoutSeconds = int32(2)
+			}
+			if replset.ReadinessProbe.PeriodSeconds == 0 {
+				replset.ReadinessProbe.PeriodSeconds = int32(3)
+			}
+			if replset.ReadinessProbe.FailureThreshold == 0 {
+				replset.ReadinessProbe.FailureThreshold = int32(8)
+			}
+		} else {
+			replset.ReadinessProbe = nil
 		}
 
 		err := replset.SetDefauts(platform, cr.Spec.UnsafeConf, log)
