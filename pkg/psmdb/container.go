@@ -35,6 +35,10 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		},
 	}
 
+	if len(*replset.ExtraMounts) > 0 {
+		volumes = append(volumes, *replset.ExtraMounts...)
+	}
+
 	if *m.Spec.Mongod.Security.EnableEncryption {
 		volumes = append(volumes,
 			corev1.VolumeMount{
@@ -73,6 +77,10 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 			{
 				Name:  "MONGODB_REPLSET",
 				Value: replset.Name,
+			},
+			{
+				Name: "EXTERNAL_DNS_ZONE",
+				Value:  m.Spec.ExternalDnsZone,
 			},
 		},
 		EnvFrom: []corev1.EnvFromSource{
