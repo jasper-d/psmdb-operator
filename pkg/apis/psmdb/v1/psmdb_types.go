@@ -196,8 +196,6 @@ type ReplsetSpec struct {
 	PodSecurityContext       *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
 	ContainerSecurityContext *corev1.SecurityContext    `json:"containerSecurityContext,omitempty"`
 	InitContainers           *[]corev1.Container
-	ExtraVolumes             *[]corev1.Volume           `json:"extraVolumes,omitempty"`
-	ExtraMounts              *[]corev1.VolumeMount      `json:"extraMounts,omitempty"`
 	MultiAZ
 }
 

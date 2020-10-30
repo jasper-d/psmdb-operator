@@ -70,10 +70,6 @@ func StatefulSpec(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, contain
 		)
 	}
 
-	if len(*replset.ExtraVolumes) > 0 {
-		volumes = append(volumes, *replset.ExtraVolumes...)
-	}
-
 	c, err := container(m, replset, containerName, resources, ikeyName)
 	if err != nil {
 		return appsv1.StatefulSetSpec{}, fmt.Errorf("failed to create container %v", err)
