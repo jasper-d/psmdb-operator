@@ -79,12 +79,10 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 
 
 	if svc.ObjectMeta.Annotations[ExternalDnsAnnotation] != "" {
-		log.Info(fmt.Sprintf("ExternalDnsAnnotation not empty, got %s", svc.ObjectMeta.Annotations[ExternalDnsAnnotation]))
 		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = ""
 	}
 	if replset.Expose.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
 		serviceAddress := fmt.Sprintf("%s.%s", podName, replset.Expose.ExternalDnsZone)
-		log.Info(fmt.Sprintf("Creating service annotation with serviceAddress %s", serviceAddress))
 		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = serviceAddress
 	}
 
