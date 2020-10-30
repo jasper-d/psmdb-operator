@@ -52,6 +52,7 @@ type PerconaServerMongoDBSpec struct {
 	Platform                *version.Platform                    `json:"platform,omitempty"`
 	Image                   string                               `json:"image,omitempty"`
 	ImagePullSecrets        []corev1.LocalObjectReference        `json:"imagePullSecrets,omitempty"`
+	Command                 []string                             `json:"command,omitempty"`
 	RunUID                  int64                                `json:"runUid,omitempty"`
 	UnsafeConf              bool                                 `json:"allowUnsafeConfigurations"`
 	Mongod                  *MongodSpec                          `json:"mongod,omitempty"`

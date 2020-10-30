@@ -53,6 +53,7 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		Name:            name,
 		Image:           m.Spec.Image,
 		ImagePullPolicy: m.Spec.ImagePullPolicy,
+		Command:         m.Spec.Command,
 		Args:            containerArgs(m, replset, resources),
 		Ports: []corev1.ContainerPort{
 			{
