@@ -70,7 +70,7 @@ func StatefulSpec(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, contain
 		)
 	}
 
-	if replset.ExtraVolumes != nil && len(*replset.ExtraVolumes) > 0 {
+	if len(*replset.ExtraVolumes) > 0 {
 		volumes = append(volumes, *replset.ExtraVolumes...)
 	}
 

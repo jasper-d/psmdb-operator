@@ -146,15 +146,6 @@ func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log
 			replset.LivenessProbe = new(LivenessProbeExtended)
 		}
 
-		if replset.ExtraMounts == nil {
-			replset.ExtraMounts = &[]corev1.VolumeMount{}
-		}
-
-		if replset.ExtraVolumes == nil {
-			replset.ExtraVolumes = &[]corev1.Volume{}
-		}
-
-
 		if replset.LivenessProbe.InitialDelaySeconds == 0 {
 			replset.LivenessProbe.InitialDelaySeconds = initialDelaySecondsDefault
 		}
