@@ -8,13 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb"
 )
-var log2 = logf.Log.WithName("external_service")
-
 func (r *ReconcilePerconaServerMongoDB) ensureExternalServices(cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podList *corev1.PodList) ([]corev1.Service, error) {
 	services := make([]corev1.Service, 0)
 
@@ -22,7 +19,6 @@ func (r *ReconcilePerconaServerMongoDB) ensureExternalServices(cr *api.PerconaSe
 		service := &corev1.Service{}
 		if err := r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: cr.Namespace}, service); err != nil {
 			if errors.IsNotFound(err) {
-				log2.Info(fmt.Sprintf("Did not find service with name %s in namespace %s", pod.Name, cr.Namespace))
 				service = psmdb.ExternalService(cr, replset, pod.Name)
 				err = setControllerReference(cr, service, r.scheme)
 				if err != nil {
