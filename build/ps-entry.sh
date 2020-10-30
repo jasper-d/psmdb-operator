@@ -7,6 +7,25 @@ fi
 
 originalArgOne="$1"
 
+# Wait for DNS resolution
+step=0
+result=$(getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE")
+echo "$(date): Starting DNS resolution test"
+until [ $result -eq 0 ]
+do
+    if [ $step -eq 10 ]; then
+      echo "$(date): Failed to resolve hostname $HOSTNAME.$EXTERNAL_DNS_ZONE"
+      exit 42
+    fi
+
+    sleep 2
+
+    result=$(getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE")
+    echo "$(date): getent result $result"
+    ((step++))
+done
+
+
 # allow the container to be started with `--user`
 # all mongo* commands should be dropped to the correct user
 if [[ "$originalArgOne" == mongo* ]] && [ "$(id -u)" = '0' ]; then

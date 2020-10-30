@@ -3,10 +3,6 @@
 set -o errexit
 set -o xtrace
 
-echo "Sleeping for 10 seconds"
-sleep 10
-echo "Woke up after 10 seconds of sleep"
-
 if [ ! -z "$1" ]; then
   EXTERNAL_NAME="$HOSTNAME.$1"
   echo "Verify dns resolution for $EXTERNAL_NAME"
