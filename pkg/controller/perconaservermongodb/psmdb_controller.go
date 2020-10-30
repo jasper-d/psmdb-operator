@@ -457,9 +457,9 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 			return nil, fmt.Errorf("failed to get operator pod: %v", err)
 		}
 		if len(cr.Spec.InitImage) > 0 {
-			inits = append(inits, psmdb.EntrypointInitContainer(cr.Spec.InitImage, replset.Expose.ExternalDnsZone))
+			inits = append(inits, psmdb.EntrypointInitContainer(cr.Spec.InitImage))
 		} else {
-			inits = append(inits, psmdb.EntrypointInitContainer(operatorPod.Spec.Containers[0].Image, replset.Expose.ExternalDnsZone))
+			inits = append(inits, psmdb.EntrypointInitContainer(operatorPod.Spec.Containers[0].Image))
 		}
 	}
 

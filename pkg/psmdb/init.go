@@ -4,7 +4,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func EntrypointInitContainer(initImageName string, dnsZone string) corev1.Container {
+func EntrypointInitContainer(initImageName string) corev1.Container {
 	return corev1.Container{
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -14,7 +14,7 @@ func EntrypointInitContainer(initImageName string, dnsZone string) corev1.Contai
 		},
 		Image:           initImageName,
 		Name:            "mongo-init",
-		Command:         []string{"/init-entrypoint.sh", dnsZone},
+		Command:         []string{"/init-entrypoint.sh"},
 		ImagePullPolicy: corev1.PullAlways,
 	}
 }

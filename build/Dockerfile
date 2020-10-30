@@ -18,7 +18,7 @@ RUN mkdir -p build/_output/bin \
     && cp -r build/_output/bin/percona-server-mongodb-operator /usr/local/bin/percona-server-mongodb-operator
 
 FROM registry.access.redhat.com/ubi7/ubi-minimal AS ubi7
-
+RUN microdnf update && microdnf install bind-utils && microdnf clean all
 LABEL name="Percona Server for MongoDB Operator" \
       vendor="Percona" \
       summary="Percona Server for MongoDB Operator simplifies the deployment and management of Percona Server for MongoDB in a Kubernetes or OpenShift environment" \
