@@ -65,7 +65,6 @@ type PerconaServerMongoDBSpec struct {
 	SchedulerName           string                               `json:"schedulerName,omitempty"`
 	ClusterServiceDNSSuffix string                               `json:"clusterServiceDNSSuffix,omitempty"`
 	InitImage               string                               `json:"initImage,omitempty"`
-	ExternalDnsZone         string                               `json:"externalDnsZone,omitempty"`
 }
 
 const (
@@ -432,8 +431,9 @@ type Arbiter struct {
 }
 
 type Expose struct {
-	Enabled    bool               `json:"enabled"`
-	ExposeType corev1.ServiceType `json:"exposeType,omitempty"`
+	Enabled         bool               `json:"enabled"`
+	ExposeType      corev1.ServiceType `json:"exposeType,omitempty"`
+	ExternalDnsZone string             `json:"externalDnsZone,omitempty"`
 }
 
 // ServerVersion represents info about k8s / openshift server version

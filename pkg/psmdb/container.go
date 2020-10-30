@@ -76,7 +76,7 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 			},
 			{
 				Name: "EXTERNAL_DNS_ZONE",
-				Value:  m.Spec.ExternalDnsZone,
+				Value:  replset.Expose.ExternalDnsZone,
 			},
 		},
 		EnvFrom: []corev1.EnvFromSource{
