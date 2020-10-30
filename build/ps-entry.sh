@@ -1,13 +1,8 @@
 #!/bin/bash
-set -Eeuo pipefail
-
-if [ "${1:0:1}" = '-' ]; then
-	set -- mongod "$@"
-fi
-
-originalArgOne="$1"
 
 # Wait for DNS resolution
+echo >&2 "external host name: $HOSTNAME.$EXTERNAL_DNS_ZONE"
+
 step=0
 result=$(getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE")
 echo "$(date): Starting DNS resolution test"
@@ -24,7 +19,14 @@ do
     echo "$(date): getent result $result"
     ((step++))
 done
+set -Eeuo pipefail
 
+
+if [ "${1:0:1}" = '-' ]; then
+	set -- mongod "$@"
+fi
+
+originalArgOne="$1"
 
 # allow the container to be started with `--user`
 # all mongo* commands should be dropped to the correct user
