@@ -9,7 +9,7 @@ result=$?
 echo "$(date): Starting DNS resolution test"
 until [ $result -eq 0 ]
 do
-    if [ $step -eq 100 ]; then
+    if [ $step -eq 10 ]; then
       echo "$(date): Failed to resolve hostname $HOSTNAME.$EXTERNAL_DNS_ZONE"
       exit 42
     fi
