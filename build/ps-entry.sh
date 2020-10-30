@@ -4,7 +4,8 @@
 echo >&2 "external host name: $HOSTNAME.$EXTERNAL_DNS_ZONE"
 
 step=0
-result=$(getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE")
+getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE"
+result=$?
 echo "$(date): Starting DNS resolution test"
 until [ $result -eq 0 ]
 do
@@ -15,7 +16,8 @@ do
 
     sleep 2
 
-    result=$(getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE")
+    getent hosts "$HOSTNAME.$EXTERNAL_DNS_ZONE"
+    result=$?
     echo "$(date): getent result $result"
     ((step++))
 done
