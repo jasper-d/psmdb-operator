@@ -35,7 +35,7 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		},
 	}
 
-	if len(*replset.ExtraMounts) > 0 {
+	if replset.ExtraMounts != nil && len(*replset.ExtraMounts) > 0 {
 		volumes = append(volumes, *replset.ExtraMounts...)
 	}
 
