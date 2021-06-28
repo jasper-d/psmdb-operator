@@ -50,7 +50,6 @@ func Service(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec) *corev1.Serv
 			},
 			ClusterIP:                "None",
 			Selector:                 ls,
-			LoadBalancerSourceRanges: m.Spec.Mongod.LoadBalancerSourceRanges,
 		},
 	}
 }
