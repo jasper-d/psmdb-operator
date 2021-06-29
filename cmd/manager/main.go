@@ -103,7 +103,7 @@ func main() {
 	hookServer := mgr.GetWebhookServer()
 	hookServer.Port = 9001
 	log.Info("Registering webhook")
-	hookServer.Register("/host-alias-mutator", &webhook.Admission{Handler: &wh.HostAliasMutator{Client: mgr.GetClient()}} )
+	hookServer.Register("/host-alias-mutator", &webhook.Admission{Handler: &wh.HostAliasMutator{}} )
 
 	log.Info("Starting the Cmd.")
 
