@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: psmdb
+
+resources:
+- bundle.yaml
+- host-alias-webhook-configuration.yaml
+
+patchesStrategicMerge:
+- |-
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: percona-server-mongodb-operator
+  spec:
+    template:
+      spec:
+        containers:
+        - name: percona-server-mongodb-operator
+          image: percona/percona-server-mongodb-operator:1.8.0-local
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - name: tls-cert
+            mountPath: /tmp/k8s-webhook-server/serving-certs/
+            readOnly: true
+        volumes:
+        - name: tls-cert
+          secret:
+            secretName: psmdb-webhook-cert
+

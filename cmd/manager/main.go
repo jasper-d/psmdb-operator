@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	_ "github.com/Percona-Lab/percona-version-service/api"
 	certmgrscheme "github.com/jetstack/cert-manager/pkg/client/clientset/versioned/scheme"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/percona/percona-server-mongodb-operator/pkg/apis"
 	"github.com/percona/percona-server-mongodb-operator/pkg/controller"
+	wh "github.com/percona/percona-server-mongodb-operator/pkg/webhook"
 )
 
 var (
@@ -97,6 +99,11 @@ func main() {
 		log.Error(err, "")
 		os.Exit(1)
 	}
+
+	hookServer := mgr.GetWebhookServer()
+	hookServer.Port = 9001
+	log.Info("Registering webhook")
+	hookServer.Register("/host-alias-mutator", &webhook.Admission{Handler: &wh.HostAliasMutator{Client: mgr.GetClient()}} )
 
 	log.Info("Starting the Cmd.")
 
