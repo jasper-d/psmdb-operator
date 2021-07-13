@@ -12,14 +12,12 @@ patchesStrategicMerge:
   apiVersion: apps/v1
   kind: Deployment
   metadata:
-    name: percona-server-mongodb-operator
+    name: percona-server-mongodb-webhook
   spec:
     template:
       spec:
         containers:
-        - name: percona-server-mongodb-operator
-          image: percona/percona-server-mongodb-operator:1.8.0-local
-          imagePullPolicy: IfNotPresent
+        - name: percona-server-mongodb-webhook
           volumeMounts:
           - name: tls-cert
             mountPath: /tmp/k8s-webhook-server/serving-certs/

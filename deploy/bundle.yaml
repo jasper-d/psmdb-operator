@@ -536,3 +536,30 @@ spec:
               value: 5s
             - name: LOG_VERBOSE
               value: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: percona-server-mongodb-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: percona-server-mongodb-webhook
+  template:
+    metadata:
+      labels:
+        name: percona-server-mongodb-webhook
+    spec:
+      containers:
+      - name: percona-server-mongodb-webhook
+        image: percona/percona-server-mongodb-webhook:local
+        ports:
+        - containerPort: 9001
+          name: webhook
+        - containerPort: 9001
+          name: metrics
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: LOG_VERBOSE
+          value: "false"

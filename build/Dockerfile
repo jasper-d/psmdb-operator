@@ -10,6 +10,16 @@ ARG GOOS=linux
 ARG GOARCH=amd64
 ARG CGO_ENABLED=0
 
+ENV USER=psmdb-user
+ENV UID=1899
+RUN adduser \
+    --disabled-password \
+    --home "/psmdb-user" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    "${USER}"
+
 RUN mkdir -p build/_output/bin \
     && GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GO_LDFLAGS=$GO_LDFLAGS \
        go build -mod=vendor -ldflags "-w -s -X main.GitCommit=$GIT_COMMIT -X main.GitBranch=$GIT_BRANCH" \
@@ -20,13 +30,28 @@ RUN mkdir -p build/_output/bin \
        go build -mod=vendor -ldflags "-w -s -X main.GitCommit=$GIT_COMMIT -X main.GitBranch=$GIT_BRANCH" \
            -o build/_output/bin/mongodb-healthcheck \
                cmd/mongodb-healthcheck/main.go \
-    && cp -r build/_output/bin/mongodb-healthcheck /usr/local/bin/mongodb-healthcheck
+    && cp -r build/_output/bin/mongodb-healthcheck /usr/local/bin/mongodb-healthcheck \
+    && GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GO_LDFLAGS=$GO_LDFLAGS \
+       go build -mod=vendor -ldflags "-w -s -X main.GitCommit=$GIT_COMMIT -X main.GitBranch=$GIT_BRANCH" \
+           -o build/_output/bin/percona-server-mongodb-webhook \
+               cmd/webhook/main.go \
+    && cp -r build/_output/bin/percona-server-mongodb-webhook /usr/local/bin/percona-server-mongodb-webhook
 
 # Looking for all possible License/Notice files and copying them to the image
 RUN find vendor -regextype posix-extended -iregex '.*(license|notice)(\.md|\.txt|$)' \
          -exec \
             sh -c 'mkdir -pv /licenses/$(echo "$0" | sed -E "s/\/(license|notice).*$//gi") \
                    && cp -v "$0" /licenses/$(echo "$0" | sed -E "s/\/(license|notice).*$//gi")' {} \;
+
+FROM scratch AS webhook
+COPY --from=go_builder /etc/passwd /etc/passwd
+COPY --from=go_builder /etc/group /etc/group
+
+COPY --from=go_builder /usr/local/bin/percona-server-mongodb-webhook /usr/local/bin/percona-server-mongodb-webhook
+
+USER psmdb-user:psmdb-user
+
+ENTRYPOINT ["/usr/local/bin/percona-server-mongodb-webhook"]
 
 FROM registry.access.redhat.com/ubi7/ubi-minimal AS ubi7
 RUN microdnf update && microdnf clean all
@@ -47,3 +72,5 @@ COPY build/ps-entry.sh /ps-entry.sh
 COPY vendor/github.com/hashicorp /lib
 
 USER nobody
+
+

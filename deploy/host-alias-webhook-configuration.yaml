@@ -4,7 +4,7 @@ metadata:
   name: psmdb-webhook
 spec:
   selector:
-    name: percona-server-mongodb-operator
+    name: percona-server-mongodb-webhook
   ports:
   - protocol: TCP
     port: 443
@@ -18,9 +18,9 @@ metadata:
 spec:
   secretName: psmdb-webhook-cert
   dnsNames:
-  - psmdb-operator-webhook
+  - psmdb-webhook
   - psmdb-webhook.psmdb.svc
-  - psmdb-operator-webhook.psmdb.svc.cluster.local
+  - psmdb-webhook.psmdb.svc.cluster.local
   issuerRef:
     name: selfsigned-cluster-issuer
     # We can reference ClusterIssuers by changing the kind here.
@@ -39,11 +39,8 @@ metadata:
 webhooks:
 - name: hostalias.webhook.psmdb.percona.com
   objectSelector:
-    matchExpressions:
-    - key: name
-      operator: NotIn
-      values:
-        - percona-server-mongodb-operator
+    matchLabels:
+      app.kubernetes.io/managed-by: percona-server-mongodb-operator
   rules:
   - operations: ["CREATE", "UPDATE"]
     apiGroups: [""]
@@ -58,5 +55,3 @@ webhooks:
       port: 443
   sideEffects: None
   admissionReviewVersions: ["v1beta1", "v1"]
-
-
