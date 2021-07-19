@@ -17,9 +17,9 @@ import (
 
 func TestHostAliasMutator_Handle(t *testing.T) {
 
-	const podName string = "some-pod"
-	const namespace string = "some-namespace"
-
+	const podName = "some-pod"
+	const namespace = "some-namespace"
+	const dnsZone = "foo.example.com"
 	scheme := runtime.NewScheme()
 	decoder, err := admission.NewDecoder(scheme)
 
@@ -77,7 +77,7 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 		}
 	})
 
-	dnsZone := "foo.example.com"
+
 
 	testCases := []struct {
 		name               string
@@ -94,7 +94,7 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 			nil,
 		},
 		{
-			"no op",
+			"unrelated annotation",
 			map[string]string{"foo": "bar"},
 			nil,
 			0,
@@ -131,7 +131,7 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("Annotation added to aliases %s", tc.name), func(t *testing.T) {
+		t.Run(fmt.Sprintf("Add annotation %s", tc.name), func(t *testing.T) {
 			client := fake.NewSimpleClientset()
 			pod, req := setup(tc.annotations, tc.aliases)
 			client.CoreV1().Pods(namespace).Create(pod)
