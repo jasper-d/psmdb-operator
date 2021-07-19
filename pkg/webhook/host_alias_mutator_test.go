@@ -117,10 +117,16 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 				IP:        loopback,
 				Hostnames: []string{"localhost"}}},
 			1,
-			[]corev1.HostAlias{{
-				IP:        loopback,
-				Hostnames: []string{"localhost", fmt.Sprintf("%s.%s", "some-pod", dnsZone)},
-			}},
+			[]corev1.HostAlias{
+				{
+					IP:        loopback,
+					Hostnames: []string{"localhost"},
+				},
+				{
+					IP:        loopback,
+					Hostnames: []string{fmt.Sprintf("%s.%s", "some-pod", dnsZone)},
+				},
+			},
 		},
 	}
 
@@ -151,9 +157,6 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 
 			patchedPod, err := client.CoreV1().Pods(namespace).Patch(pod.Name, types.JSONPatchType, patchJson)
 
-			// hostAliasFound := false
-			// hostAlias := fmt.Sprintf("%s.%s", patchedPod.Name, dnsZone)
-
 			missing := []string{}
 			for _, ea := range tc.expectedAliases {
 				for i, aa := range patchedPod.Spec.HostAliases {
@@ -172,28 +175,6 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 			if len(missing) > 0 {
 				t.Errorf("failed to find hostaliases %v", missing)
 			}
-
-			// for _, alias := range patchedPod.Spec.HostAliases {
-			// 	if alias.IP != loopback {
-			// 		continue
-			// 	} else {
-			// 		for _, hostname := range alias.Hostnames {
-			// 			if hostname == hostAlias {
-			// 				hostAliasFound = true
-			// 				break
-			// 			}
-			// 		}
-			// 	}
-			// }
-			//
-			// if !hostAliasFound {
-			// 	hostAliases, err := json.Marshal(patchedPod.Spec.HostAliases)
-			// 	if err != nil {
-			// 		t.Errorf("failed to marshal host aliases")
-			// 	}
-			//
-			// 	t.Errorf("expected to find hostAlias %s for 127.0.0.1, all hostAliases: %s", hostAlias, hostAliases)
-			// }
 		})
 	}
 }

@@ -36,20 +36,9 @@ func (a *HostAliasMutator) Handle(_ context.Context, req admission.Request) admi
 
 	externalFqdn := fmt.Sprintf("%s.%s", pod.Name, pod.Annotations[dnsAnnotationKey])
 
-	externalFqdnAdded := false
-	for i, alias := range pod.Spec.HostAliases {
-		if alias.IP == loopback {
-			log.Info("Extending existing host alias", "alias", externalFqdn)
-			pod.Spec.HostAliases[i].Hostnames = append(alias.Hostnames, externalFqdn)
-			externalFqdnAdded = true
-			break
-		}
-	}
+	log.Info("Appending new host alias", "alias", externalFqdn)
+	pod.Spec.HostAliases = append(pod.Spec.HostAliases, corev1.HostAlias{IP: loopback, Hostnames: []string{externalFqdn}})
 
-	if !externalFqdnAdded{
-		log.Info("Appending new host alias", "alias", externalFqdn)
-		pod.Spec.HostAliases = append(pod.Spec.HostAliases, corev1.HostAlias{IP: loopback, Hostnames: []string{externalFqdn}})
-	}
 
 	podJson, err := json.Marshal(pod)
 
