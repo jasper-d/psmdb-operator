@@ -1,0 +1,30 @@
+apiVersion: v1
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        rewrite name exact my-cluster-name-rs0-0.db.example.com my-cluster-name-rs0-0.my-cluster-name-rs0.psmdb.svc.cluster.local
+        rewrite name exact my-cluster-name-rs0-1.db.example.com my-cluster-name-rs0-1.my-cluster-name-rs0.psmdb.svc.cluster.local
+        rewrite name exact my-cluster-name-rs0-2.db.example.com my-cluster-name-rs0-2.my-cluster-name-rs0.psmdb.svc.cluster.local
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
