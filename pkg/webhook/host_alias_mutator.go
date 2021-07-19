@@ -4,10 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"net/http"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -22,35 +19,8 @@ type HostAliasMutator struct {
 	decoder *admission.Decoder
 }
 
-func (a *HostAliasMutator) Handle(ctx context.Context, req admission.Request) admission.Response{
+func (a *HostAliasMutator) Handle(_ context.Context, req admission.Request) admission.Response{
 	pod := &corev1.Pod{}
-	
-	testPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "some-pod",
-			Namespace:   "some-namespace",
-			Annotations: map[string]string{"foo": "bar", "x": "y"},
-		},
-		Spec: corev1.PodSpec{
-			HostAliases: []corev1.HostAlias{{IP: "127.0.0.1", Hostnames: []string{"foo.example.com"}}},
-		},
-	}
-
-	testPodJson, err2 := json.Marshal(testPod)
-
-	if err2 != nil {
-		panic(err2)
-	}
-
-	err2 = a.decoder.Decode(admission.Request{AdmissionRequest: v1beta1.AdmissionRequest{
-		UID:                "some-uid",
-		Kind:               metav1.GroupVersionKind{},
-		Resource:           metav1.GroupVersionResource{},
-		Object:             runtime.RawExtension{Raw: testPodJson},
-		OldObject:          runtime.RawExtension{},
-		DryRun:             nil,
-		Options:            runtime.RawExtension{},
-	}}, testPod)
 
 	err := a.decoder.Decode(req, pod)
 
@@ -65,17 +35,18 @@ func (a *HostAliasMutator) Handle(ctx context.Context, req admission.Request) ad
 	}
 
 	externalFqdn := fmt.Sprintf("%s.%s", pod.Name, pod.Annotations[dnsAnnotationKey])
+
 	externalFqdnAdded := false
-	for _, alias := range pod.Spec.HostAliases {
+	for i, alias := range pod.Spec.HostAliases {
 		if alias.IP == loopback {
 			log.Info("Extending existing host alias", "alias", externalFqdn)
-			alias.Hostnames = append(alias.Hostnames, externalFqdn)
+			pod.Spec.HostAliases[i].Hostnames = append(alias.Hostnames, externalFqdn)
 			externalFqdnAdded = true
 			break
 		}
 	}
 
-	if !externalFqdnAdded {
+	if !externalFqdnAdded{
 		log.Info("Appending new host alias", "alias", externalFqdn)
 		pod.Spec.HostAliases = append(pod.Spec.HostAliases, corev1.HostAlias{IP: loopback, Hostnames: []string{externalFqdn}})
 	}

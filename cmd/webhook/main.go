@@ -37,7 +37,7 @@ func main(){
 		os.Exit(1)
 	}
 
-	mgr, err := manager.New(cfg, manager.Options{})
+	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
 
 	if err != nil {
 		log.Error(err, "")
