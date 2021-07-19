@@ -1094,7 +1094,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 	// add dns zone annotation used by host alias mutator webhook
 	// TODO: Do the same for LB ingress addresses somehow???
 	if dnsZone != "" {
-		sfs.Spec.Template.Annotations[dnsAnnotationKey] = dnsZone
+		sfsSpec.Template.Annotations[dnsAnnotationKey] = dnsZone
 	}
 
 	for k, v := range sfs.Spec.Template.Annotations {
