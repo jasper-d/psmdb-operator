@@ -42,6 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
+const dnsAnnotationKey = "percona.com/dns-zone" // TODO: currently defined here and in host_alias_mutator.go
+
 var secretFileMode int32 = 288
 var log = logf.Log.WithName("controller_psmdb")
 
@@ -341,6 +343,7 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(request reconcile.Request) (re
 			return reconcile.Result{}, errors.Errorf("%s is reserved name for config server replset", api.ConfigReplSetName)
 		}
 
+
 		matchLabels := map[string]string{
 			"app.kubernetes.io/name":       "percona-server-mongodb",
 			"app.kubernetes.io/instance":   cr.Name,
@@ -360,14 +363,16 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(request reconcile.Request) (re
 			return reconcile.Result{}, errors.Wrap(err, "get pods list for mongos")
 		}
 
-		_, err = r.reconcileStatefulSet(false, cr, replset, matchLabels, internalKey)
+
+		_, err = r.reconcileStatefulSet(false, cr, replset, matchLabels, internalKey, replset.Expose.ExternalDnsZone)
 		if err != nil {
 			err = errors.Errorf("reconcile StatefulSet for %s: %v", replset.Name, err)
 			return reconcile.Result{}, err
 		}
 
 		if replset.Arbiter.Enabled {
-			_, err := r.reconcileStatefulSet(true, cr, replset, matchLabels, internalKey)
+			// TODO: Does externalDnsZone work with arbiter?
+			_, err := r.reconcileStatefulSet(true, cr, replset, matchLabels, internalKey, replset.Expose.ExternalDnsZone)
 			if err != nil {
 				err = errors.Errorf("reconcile Arbiter StatefulSet for %s: %v", replset.Name, err)
 				return reconcile.Result{}, err
@@ -406,19 +411,22 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(request reconcile.Request) (re
 				}
 				srvs = lbsvc
 			}
-		} else {
-			service := psmdb.Service(cr, replset)
-
-			err = setControllerReference(cr, service, r.scheme)
-			if err != nil {
-				return reconcile.Result{}, errors.Wrap(err, "set owner ref for service "+service.Name)
-			}
-
-			err = r.createOrUpdate(service)
-			if err != nil {
-				return reconcile.Result{}, errors.Wrap(err, "create or update service for replset "+replset.Name)
-			}
 		}
+
+		// always create a headless service to allow users to keep replication traffic within the cluster,
+		// avoiding an extra hop to the LB and potentially reducing costs for the LB as well
+		service := psmdb.Service(cr, replset)
+
+		err = setControllerReference(cr, service, r.scheme)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "set owner ref for service "+service.Name)
+		}
+
+		err = r.createOrUpdate(service)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "create or update service for replset "+replset.Name)
+		}
+
 
 		_, ok := cr.Status.Replsets[replset.Name]
 		if !ok {
@@ -1025,7 +1033,7 @@ func (r *ReconcilePerconaServerMongoDB) sslAnnotation(cr *api.PerconaServerMongo
 
 // TODO: reduce cyclomatic complexity
 func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *api.PerconaServerMongoDB,
-	replset *api.ReplsetSpec, matchLabels map[string]string, internalKeyName string) (*appsv1.StatefulSet, error) {
+	replset *api.ReplsetSpec, matchLabels map[string]string, internalKeyName string, dnsZone string) (*appsv1.StatefulSet, error) {
 
 	sfsName := cr.Name + "-" + replset.Name
 	size := replset.Size
@@ -1082,6 +1090,13 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 	if sfsSpec.Template.Annotations == nil {
 		sfsSpec.Template.Annotations = make(map[string]string)
 	}
+
+	// add dns zone annotation used by host alias mutator webhook
+	// TODO: Do the same for LB ingress addresses somehow???
+	if dnsZone != "" {
+		sfs.Spec.Template.Annotations[dnsAnnotationKey] = dnsZone
+	}
+
 	for k, v := range sfs.Spec.Template.Annotations {
 		if _, ok := sfsSpec.Template.Annotations[k]; !ok {
 			sfsSpec.Template.Annotations[k] = v

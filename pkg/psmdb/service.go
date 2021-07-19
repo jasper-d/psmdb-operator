@@ -2,6 +2,7 @@ package psmdb
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+const ExternalDnsAnnotation = "external-dns.alpha.kubernetes.io/hostname"
 
 // Service returns a core/v1 API Service
 func Service(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec) *corev1.Service {
@@ -62,6 +65,14 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 			Name:      podName,
 			Namespace: m.Namespace,
 		},
+	}
+
+	if svc.ObjectMeta.Annotations[ExternalDnsAnnotation] != "" {
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = ""
+	}
+	if replset.Expose.ExternalDnsZone != "" && svc.ObjectMeta.Annotations[ExternalDnsAnnotation] == "" {
+		serviceAddress := fmt.Sprintf("%s.%s", podName, replset.Expose.ExternalDnsZone)
+		svc.ObjectMeta.Annotations[ExternalDnsAnnotation] = serviceAddress
 	}
 
 	svc.Labels = map[string]string{
@@ -121,10 +132,18 @@ func GetServiceAddr(svc corev1.Service, pod corev1.Pod, cl client.Client) (*Serv
 		}
 
 	case corev1.ServiceTypeLoadBalancer:
-		host, err := getIngressPoint(pod, cl)
-		if err != nil {
-			return nil, errors.Wrap(err, "get ingress endpoint")
+		var err error
+		var host string
+
+		if svc.Annotations[ExternalDnsAnnotation] != "" {
+			host = svc.Annotations[ExternalDnsAnnotation]
+		} else {
+			host, err = getIngressPoint(pod, cl)
+			if err != nil {
+				return nil, errors.Wrap(err, "get ingress endpoint")
+			}
 		}
+
 		addr.Host = host
 		for _, p := range svc.Spec.Ports {
 			if p.Name != mongodPortName {
