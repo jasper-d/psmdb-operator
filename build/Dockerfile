@@ -14,7 +14,8 @@ ENV USER=psmdb-user
 ENV UID=1899
 RUN adduser \
     --disabled-password \
-    --home "/psmdb-user" \
+    --gecos "" \
+    --home "/nonexistent" \
     --shell "/sbin/nologin" \
     --no-create-home \
     --uid "${UID}" \
