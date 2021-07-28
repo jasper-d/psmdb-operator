@@ -315,6 +315,8 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(m *api.PerconaServerMo
 			return fmt.Errorf("get host for the pod %s: %v", pod.Name, err)
 		}
 
+		log.Info("using host: %s", host)
+
 		cmd := []string{
 			"sh", "-c",
 			fmt.Sprintf(

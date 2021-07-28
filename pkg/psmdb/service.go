@@ -101,8 +101,8 @@ func ExternalService(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, podN
 		svc.Spec.Type = corev1.ServiceTypeNodePort
 		svc.Spec.ExternalTrafficPolicy = "Local"
 	case corev1.ServiceTypeLoadBalancer:
-		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
-		svc.Spec.ExternalTrafficPolicy = "Cluster"
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+		// svc.Spec.ExternalTrafficPolicy = "Cluster"
 	default:
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 	}
@@ -124,7 +124,12 @@ func GetServiceAddr(svc corev1.Service, pod corev1.Pod, cl client.Client) (*Serv
 
 	switch svc.Spec.Type {
 	case corev1.ServiceTypeClusterIP:
-		addr.Host = svc.Spec.ClusterIP
+		if svc.Annotations[ExternalDnsAnnotation] != "" {
+			addr.Host = svc.Annotations[ExternalDnsAnnotation]
+		} else {
+			addr.Host = svc.Spec.ClusterIP
+		}
+
 		for _, p := range svc.Spec.Ports {
 			if p.Name != mongodPortName {
 				continue
@@ -133,19 +138,16 @@ func GetServiceAddr(svc corev1.Service, pod corev1.Pod, cl client.Client) (*Serv
 		}
 
 	case corev1.ServiceTypeLoadBalancer:
-		var err error
-		var host string
-
 		if svc.Annotations[ExternalDnsAnnotation] != "" {
-			host = svc.Annotations[ExternalDnsAnnotation]
+			addr.Host = svc.Annotations[ExternalDnsAnnotation]
 		} else {
-			host, err = getIngressPoint(pod, cl)
+			var err error = nil
+			addr.Host, err = getIngressPoint(pod, cl)
 			if err != nil {
 				return nil, errors.Wrap(err, "get ingress endpoint")
 			}
 		}
 
-		addr.Host = host
 		for _, p := range svc.Spec.Ports {
 			if p.Name != mongodPortName {
 				continue
@@ -225,8 +227,11 @@ func MongoHost(cl client.Client, m *api.PerconaServerMongoDB, rsName string, rsE
 	if rsExposed {
 		return getExtAddr(cl, m.Namespace, pod)
 	}
-
 	return GetAddr(m, pod.Name, rsName), nil
+}
+
+func MongoOwnHost(cl client.Client, m *api.PerconaServerMongoDB, rsName string, rsExposed bool, pod corev1.Pod) (string, error){
+	return "", nil
 }
 
 func getExtAddr(cl client.Client, namespace string, pod corev1.Pod) (string, error) {

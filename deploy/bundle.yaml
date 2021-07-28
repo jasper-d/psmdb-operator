@@ -514,13 +514,13 @@ spec:
       serviceAccountName: percona-server-mongodb-operator
       containers:
         - name: percona-server-mongodb-operator
-          image: percona/percona-server-mongodb-operator:local
+          image: percona/percona-server-mongodb-operator:local2
+          imagePullPolicy: IfNotPresent
           ports:
           - containerPort: 60000
             name: metrics
           command:
           - percona-server-mongodb-operator
-          imagePullPolicy: IfNotPresent
           env:
             - name: WATCH_NAMESPACE
               valueFrom:
