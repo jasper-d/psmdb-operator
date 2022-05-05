@@ -12,6 +12,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -20,9 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	psmdbv1 "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/backup"
+	"github.com/percona/percona-server-mongodb-operator/version"
 )
 
 var log = logf.Log.WithName("controller_perconaservermongodbbackup")
@@ -85,13 +86,13 @@ type ReconcilePerconaServerMongoDBBackup struct {
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
-func (r *ReconcilePerconaServerMongoDBBackup) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+func (r *ReconcilePerconaServerMongoDBBackup) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	rr := reconcile.Result{
 		RequeueAfter: time.Second * 5,
 	}
 	// Fetch the PerconaServerMongoDBBackup instance
 	cr := &psmdbv1.PerconaServerMongoDBBackup{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, cr)
+	err := r.client.Get(ctx, request.NamespacedName, cr)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -118,7 +119,7 @@ func (r *ReconcilePerconaServerMongoDBBackup) Reconcile(request reconcile.Reques
 		}
 		if cr.Status.State != status.State || cr.Status.Error != status.Error {
 			cr.Status = status
-			uerr := r.updateStatus(cr)
+			uerr := r.updateStatus(ctx, cr)
 			if uerr != nil {
 				log.Error(uerr, "failed to update backup status", "backup", cr.Name)
 			}
@@ -130,18 +131,42 @@ func (r *ReconcilePerconaServerMongoDBBackup) Reconcile(request reconcile.Reques
 		return rr, errors.Wrap(err, "fields check")
 	}
 
-	bcp, err := r.newBackup(cr)
+	cluster := &psmdbv1.PerconaServerMongoDB{}
+	err = r.client.Get(ctx, types.NamespacedName{Name: cr.Spec.GetClusterName(), Namespace: cr.Namespace}, cluster)
+	if err != nil {
+		return rr, errors.Wrapf(err, "get cluster %s/%s", cr.Namespace, cr.Spec.GetClusterName())
+	}
+
+	// TODO: Remove after 1.15
+	if cluster.CompareVersion("1.12.0") >= 0 && cr.Spec.ClusterName == "" {
+		cr.Spec.ClusterName = cr.Spec.PSMDBCluster
+		cr.Spec.PSMDBCluster = ""
+		if err := r.client.Update(ctx, cr); err != nil {
+			return rr, errors.Wrap(err, "failed to update clusterName")
+		}
+	}
+
+	svr, err := version.Server()
+	if err != nil {
+		return rr, errors.Wrapf(err, "fetch server version")
+	}
+
+	if err := cluster.CheckNSetDefaults(svr.Platform, log); err != nil {
+		return rr, errors.Wrapf(err, "set defaults for %s/%s", cluster.Namespace, cluster.Name)
+	}
+
+	bcp, err := r.newBackup(ctx, cluster, cr)
 	if err != nil {
 		return rr, errors.Wrap(err, "create backup object")
 	}
-	defer bcp.Close()
+	defer bcp.Close(ctx)
 
-	err = r.checkFinalizers(cr, bcp)
+	err = r.checkFinalizers(ctx, cr, bcp)
 	if err != nil {
 		return rr, errors.Wrap(err, "failed to run finalizer")
 	}
 
-	status, err = r.reconcile(cr, bcp)
+	status, err = r.reconcile(ctx, cluster, cr, bcp)
 	if err != nil {
 		return rr, errors.Wrap(err, "reconcile backup")
 	}
@@ -150,20 +175,19 @@ func (r *ReconcilePerconaServerMongoDBBackup) Reconcile(request reconcile.Reques
 }
 
 // reconcile backup. firstly we check if there are concurrent jobs running
-func (r *ReconcilePerconaServerMongoDBBackup) reconcile(cr *psmdbv1.PerconaServerMongoDBBackup, bcp *Backup) (psmdbv1.PerconaServerMongoDBBackupStatus, error) {
+func (r *ReconcilePerconaServerMongoDBBackup) reconcile(
+	ctx context.Context,
+	cluster *psmdbv1.PerconaServerMongoDB,
+	cr *psmdbv1.PerconaServerMongoDBBackup,
+	bcp *Backup,
+) (psmdbv1.PerconaServerMongoDBBackupStatus, error) {
 	status := cr.Status
-
-	cluster := &api.PerconaServerMongoDB{}
-	err := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.PSMDBCluster, Namespace: cr.Namespace}, cluster)
-	if err != nil {
-		return status, errors.Wrapf(err, "get cluster %s/%s", cr.Namespace, cr.Spec.PSMDBCluster)
-	}
 
 	if err := cluster.CanBackup(); err != nil {
 		return status, errors.Wrap(err, "failed to run backup")
 	}
 
-	cjobs, err := backup.HasActiveJobs(r.client, cluster, backup.NewBackupJob(cr.Name), backup.NotPITRLock)
+	cjobs, err := backup.HasActiveJobs(ctx, r.client, cluster, backup.NewBackupJob(cr.Name), backup.NotPITRLock)
 	if err != nil {
 		return status, errors.Wrap(err, "check for concurrent jobs")
 	}
@@ -177,16 +201,20 @@ func (r *ReconcilePerconaServerMongoDBBackup) reconcile(cr *psmdbv1.PerconaServe
 	}
 
 	if cr.Status.State == psmdbv1.BackupStateNew || cr.Status.State == psmdbv1.BackupStateWaiting {
+		priorities, err := bcp.pbm.GetPriorities(ctx, r.client, cluster)
+		if err != nil {
+			return status, errors.Wrap(err, "get PBM priorities")
+		}
 		time.Sleep(10 * time.Second)
-		return bcp.Start(cr)
+		return bcp.Start(ctx, cr, priorities)
 	}
 
 	time.Sleep(5 * time.Second)
 	return bcp.Status(cr)
 }
 
-func (r *ReconcilePerconaServerMongoDBBackup) checkFinalizers(cr *api.PerconaServerMongoDBBackup, b *Backup) error {
-	var err error = nil
+func (r *ReconcilePerconaServerMongoDBBackup) checkFinalizers(ctx context.Context, cr *psmdbv1.PerconaServerMongoDBBackup, b *Backup) error {
+	var err error
 	if cr.ObjectMeta.DeletionTimestamp == nil {
 		return nil
 	}
@@ -212,21 +240,24 @@ func (r *ReconcilePerconaServerMongoDBBackup) checkFinalizers(cr *api.PerconaSer
 	}
 
 	cr.SetFinalizers(finalizers)
-	err = r.client.Update(context.TODO(), cr)
+	err = r.client.Update(ctx, cr)
 
 	return err
 }
 
-func (r *ReconcilePerconaServerMongoDBBackup) updateStatus(cr *psmdbv1.PerconaServerMongoDBBackup) error {
-	err := r.client.Status().Update(context.TODO(), cr)
-	if err != nil {
-		// may be it's k8s v1.10 and erlier (e.g. oc3.9) that doesn't support status updates
-		// so try to update whole CR
-		//TODO: Update will not return error if user have no rights to update Status. Do we need to do something?
-		err := r.client.Update(context.TODO(), cr)
+func (r *ReconcilePerconaServerMongoDBBackup) updateStatus(ctx context.Context, cr *psmdbv1.PerconaServerMongoDBBackup) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		c := &psmdbv1.PerconaServerMongoDBBackup{}
+
+		err := r.client.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, c)
 		if err != nil {
-			return errors.Wrap(err, "send update")
+			return err
 		}
-	}
-	return nil
+
+		c.Status = cr.Status
+
+		return r.client.Status().Update(ctx, c)
+	})
+
+	return errors.Wrap(err, "write status")
 }

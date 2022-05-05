@@ -5,7 +5,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -14,7 +13,8 @@ const (
 )
 
 // PMMContainer returns a pmm container from given spec
-func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterName string, v120OrGreater bool, v160OrGreater bool, customAdminParams string) corev1.Container {
+func PMMContainer(cr *api.PerconaServerMongoDB, secrets string, customLogin bool, clusterName string, v120OrGreater bool, v160OrGreater bool, customAdminParams string) corev1.Container {
+	spec := cr.Spec.PMM
 	ports := []corev1.ContainerPort{{ContainerPort: 7777}}
 
 	for i := 30100; i <= 30105; i++ {
@@ -26,7 +26,7 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterNam
 			Name: "MONGODB_USER",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					Key: "MONGODB_CLUSTER_MONITOR_USER",
+					Key: "MONGODB_CLUSTER_MONITOR_USER_ESCAPED",
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: secrets,
 					},
@@ -37,7 +37,7 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterNam
 			Name: "MONGODB_PASSWORD",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					Key: "MONGODB_CLUSTER_MONITOR_PASSWORD",
+					Key: "MONGODB_CLUSTER_MONITOR_PASSWORD_ESCAPED",
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: secrets,
 					},
@@ -96,7 +96,7 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterNam
 	pmm := corev1.Container{
 		Name:            "pmm-client",
 		Image:           spec.Image,
-		ImagePullPolicy: corev1.PullAlways,
+		ImagePullPolicy: cr.Spec.ImagePullPolicy,
 		Env: []corev1.EnvVar{
 			{
 				Name:  "PMM_SERVER",
@@ -149,7 +149,7 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterNam
 			InitialDelaySeconds: 60,
 			TimeoutSeconds:      5,
 			PeriodSeconds:       10,
-			Handler: corev1.Handler{
+			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Port: intstr.FromInt(7777),
 					Path: "/local/Status",
@@ -162,7 +162,7 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool, clusterNam
 	return pmm
 }
 
-func pmmAgentEnvs(pmmServerHost string, customLogin bool, secrets string, customAdminParams string) []corev1.EnvVar {
+func pmmAgentEnvs(pmmServerHost string, customLogin bool, secrets, customAdminParams string) []corev1.EnvVar {
 	pmmAgentEnvs := []corev1.EnvVar{
 		{
 			Name: "POD_NAME",
@@ -283,17 +283,13 @@ func AddPMMContainer(cr *api.PerconaServerMongoDB, usersSecretName string, pmmse
 	_, okp := pmmsec.Data[PMMPasswordKey]
 	is120 := cr.CompareVersion("1.2.0") >= 0
 
-	pmmC := PMMContainer(cr.Spec.PMM, usersSecretName, okl && okp, cr.Name, is120, cr.CompareVersion("1.6.0") >= 0, customAdminParams)
+	pmmC := PMMContainer(cr, usersSecretName, okl && okp, cr.Name, is120, cr.CompareVersion("1.6.0") >= 0, customAdminParams)
 	if is120 {
-		res, err := CreateResources(cr.Spec.PMM.Resources)
-		if err != nil {
-			return corev1.Container{}, errors.Wrap(err, "create resources")
-		}
-		pmmC.Resources = res
+		pmmC.Resources = cr.Spec.PMM.Resources
 	}
 	if cr.CompareVersion("1.6.0") >= 0 {
 		pmmC.Lifecycle = &corev1.Lifecycle{
-			PreStop: &corev1.Handler{
+			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
 					Command: []string{"bash", "-c", "pmm-admin inventory remove node --force $(pmm-admin status --json | python -c \"import sys, json; print(json.load(sys.stdin)['pmm_agent_status']['node_id'])\")"},
 				},
@@ -308,6 +304,22 @@ func AddPMMContainer(cr *api.PerconaServerMongoDB, usersSecretName string, pmmse
 		pmmC.Env = append(pmmC.Env, clusterPmmEnvs...)
 		pmmAgentScriptEnv := PMMAgentScript()
 		pmmC.Env = append(pmmC.Env, pmmAgentScriptEnv...)
+	}
+	if cr.CompareVersion("1.10.0") >= 0 {
+		// PMM team added these flags which allows us to avoid
+		// container crash, but just restart pmm-agent till it recovers
+		// the connection.
+		sidecarEnvs := []corev1.EnvVar{
+			{
+				Name:  "PMM_AGENT_SIDECAR",
+				Value: "true",
+			},
+			{
+				Name:  "PMM_AGENT_SIDECAR_SLEEP",
+				Value: "5",
+			},
+		}
+		pmmC.Env = append(pmmC.Env, sidecarEnvs...)
 	}
 
 	return pmmC, nil

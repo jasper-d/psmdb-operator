@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/pkg/errors"
@@ -23,10 +24,11 @@ type Config struct {
 	Username    string
 	Password    string
 	TLSConf     *tls.Config
+	Direct      bool
 }
 
 func Dial(conf *Config) (*mongo.Client, error) {
-	ctx, connectcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, connectcancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer connectcancel()
 
 	opts := options.Client().
@@ -37,11 +39,12 @@ func Dial(conf *Config) (*mongo.Client, error) {
 			Username: conf.Username,
 		}).
 		SetWriteConcern(writeconcern.New(writeconcern.WMajority(), writeconcern.J(true))).
-		SetReadPreference(readpref.Primary()).SetTLSConfig(conf.TLSConf)
+		SetReadPreference(readpref.Primary()).SetTLSConfig(conf.TLSConf).
+		SetDirect(conf.Direct)
 
 	client, err := mongo.Connect(ctx, opts)
 	if err != nil {
-		return nil, errors.Errorf("failed to connect to mongo rs: %v", err)
+		return nil, errors.Wrap(err, "connect to mongo rs")
 	}
 
 	defer func() {
@@ -53,12 +56,12 @@ func Dial(conf *Config) (*mongo.Client, error) {
 		}
 	}()
 
-	ctx, pingcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, pingcancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer pingcancel()
 
 	err = client.Ping(ctx, readpref.Primary())
 	if err != nil {
-		return nil, errors.Errorf("failed to ping mongo: %v", err)
+		return nil, errors.Wrap(err, "ping mongo")
 	}
 
 	return client, nil
@@ -71,7 +74,7 @@ func ReadConfig(ctx context.Context, client *mongo.Client) (RSConfig, error) {
 		return RSConfig{}, errors.Wrap(res.Err(), "replSetGetConfig")
 	}
 	if err := res.Decode(&resp); err != nil {
-		return RSConfig{}, errors.Wrap(err, "failed to decoge to replSetGetConfig")
+		return RSConfig{}, errors.Wrap(err, "failed to decode to replSetGetConfig")
 	}
 
 	if resp.Config == nil {
@@ -81,7 +84,7 @@ func ReadConfig(ctx context.Context, client *mongo.Client) (RSConfig, error) {
 	return *resp.Config, nil
 }
 
-func CreateRole(ctx context.Context, client *mongo.Client, role string, privileges []interface{}, roles []interface{}) error {
+func CreateRole(ctx context.Context, client *mongo.Client, role string, privileges []RolePrivilege, roles []interface{}) error {
 	resp := OKResponse{}
 
 	privilegesArr := bson.A{}
@@ -100,7 +103,7 @@ func CreateRole(ctx context.Context, client *mongo.Client, role string, privileg
 		{Key: "roles", Value: rolesArr},
 	}
 
-	res := client.Database("admin").RunCommand(context.Background(), m)
+	res := client.Database("admin").RunCommand(ctx, m)
 	if res.Err() != nil {
 		return errors.Wrap(res.Err(), "failed to create role")
 	}
@@ -117,10 +120,70 @@ func CreateRole(ctx context.Context, client *mongo.Client, role string, privileg
 	return nil
 }
 
-func CreateUser(ctx context.Context, client *mongo.Client, user, pwd string, roles ...interface{}) error {
+func UpdateRole(ctx context.Context, client *mongo.Client, role string, privileges []RolePrivilege, roles []interface{}) error {
 	resp := OKResponse{}
 
-	res := client.Database("admin").RunCommand(context.Background(), bson.D{
+	privilegesArr := bson.A{}
+	for _, p := range privileges {
+		privilegesArr = append(privilegesArr, p)
+	}
+
+	rolesArr := bson.A{}
+	for _, r := range roles {
+		rolesArr = append(rolesArr, r)
+	}
+
+	m := bson.D{
+		{Key: "updateRole", Value: role},
+		{Key: "privileges", Value: privilegesArr},
+		{Key: "roles", Value: rolesArr},
+	}
+
+	res := client.Database("admin").RunCommand(ctx, m)
+	if res.Err() != nil {
+		return errors.Wrap(res.Err(), "failed to create role")
+	}
+
+	err := res.Decode(&resp)
+	if err != nil {
+		return errors.Wrap(err, "failed to decode response")
+	}
+
+	if resp.OK != 1 {
+		return errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+
+	return nil
+}
+
+func GetRole(ctx context.Context, client *mongo.Client, role string) (*Role, error) {
+	resp := RoleInfo{}
+
+	res := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "rolesInfo", Value: role},
+		{Key: "showPrivileges", Value: true},
+	})
+	if res.Err() != nil {
+		return nil, errors.Wrap(res.Err(), "run command")
+	}
+
+	err := res.Decode(&resp)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode response")
+	}
+	if resp.OK != 1 {
+		return nil, errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+	if len(resp.Roles) == 0 {
+		return nil, nil
+	}
+	return &resp.Roles[0], nil
+}
+
+func CreateUser(ctx context.Context, client *mongo.Client, user, pwd string, roles ...map[string]interface{}) error {
+	resp := OKResponse{}
+
+	res := client.Database("admin").RunCommand(ctx, bson.D{
 		{Key: "createUser", Value: user},
 		{Key: "pwd", Value: pwd},
 		{Key: "roles", Value: roles},
@@ -170,7 +233,7 @@ func WriteConfig(ctx context.Context, client *mongo.Client, cfg RSConfig) error 
 	}
 
 	if err := res.Decode(&resp); err != nil {
-		return errors.Wrap(err, "failed to decoge to replSetReconfigResponse")
+		return errors.Wrap(err, "failed to decode to replSetReconfigResponse")
 	}
 
 	if resp.OK != 1 {
@@ -386,6 +449,48 @@ func StepDown(ctx context.Context, client *mongo.Client, force bool) error {
 	return nil
 }
 
+func IsMaster(ctx context.Context, client *mongo.Client) (*IsMasterResp, error) {
+	cur := client.Database("admin").RunCommand(ctx, bson.D{{Key: "isMaster", Value: 1}})
+	if cur.Err() != nil {
+		return nil, errors.Wrap(cur.Err(), "run isMaster")
+	}
+
+	resp := IsMasterResp{}
+	if err := cur.Decode(&resp); err != nil {
+		return nil, errors.Wrap(err, "decode isMaster response")
+	}
+
+	if resp.OK != 1 {
+		return nil, errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+
+	return &resp, nil
+}
+
+func GetUserInfo(ctx context.Context, client *mongo.Client, username string) (*User, error) {
+	resp := UsersInfo{}
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "usersInfo", Value: username}})
+	if res.Err() != nil {
+		return nil, errors.Wrap(res.Err(), "run command")
+	}
+
+	err := res.Decode(&resp)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode response")
+	}
+	if resp.OK != 1 {
+		return nil, errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+	if len(resp.Users) == 0 {
+		return nil, nil
+	}
+	return &resp.Users[0], nil
+}
+
+func UpdateUserRoles(ctx context.Context, client *mongo.Client, username string, roles []map[string]interface{}) error {
+	return client.Database("admin").RunCommand(ctx, bson.D{{Key: "updateUser", Value: username}, {Key: "roles", Value: roles}}).Err()
+}
+
 // UpdateUserPass updates user's password
 func UpdateUserPass(ctx context.Context, client *mongo.Client, name, pass string) error {
 	return client.Database("admin").RunCommand(ctx, bson.D{{Key: "updateUser", Value: name}, {Key: "pwd", Value: pass}}).Err()
@@ -413,12 +518,12 @@ func UpdateUser(ctx context.Context, client *mongo.Client, currName, newName, pa
 		return errors.New("empty user data")
 	}
 
-	err = client.Database("admin").RunCommand(context.TODO(), bson.D{{Key: "createUser", Value: newName}, {Key: "pwd", Value: pass}, {Key: "roles", Value: mu.Users[0].Roles}}).Err()
+	err = client.Database("admin").RunCommand(ctx, bson.D{{Key: "createUser", Value: newName}, {Key: "pwd", Value: pass}, {Key: "roles", Value: mu.Users[0].Roles}}).Err()
 	if err != nil {
 		return errors.Wrap(err, "create user")
 	}
 
-	err = client.Database("admin").RunCommand(context.TODO(), bson.D{{Key: "dropUser", Value: currName}}).Err()
+	err = client.Database("admin").RunCommand(ctx, bson.D{{Key: "dropUser", Value: currName}}).Err()
 	return errors.Wrap(err, "drop user")
 }
 
@@ -439,6 +544,94 @@ func (m *ConfigMembers) RemoveOld(compareWith ConfigMembers) (changes bool) {
 		if _, ok := cm[member.Host]; !ok {
 			*m = append([]ConfigMember(*m)[:i], []ConfigMember(*m)[i+1:]...)
 			changes = true
+		}
+	}
+
+	return changes
+}
+
+func (m *ConfigMembers) FixHosts(compareWith ConfigMembers) (changes bool) {
+	if len(*m) < 1 {
+		return changes
+	}
+
+	cm := make(map[string]string, len(compareWith))
+
+	for _, member := range compareWith {
+		name, ok := member.Tags["podName"]
+		if !ok {
+			continue
+		}
+		cm[name] = member.Host
+	}
+
+	for i := 0; i < len(*m); i++ {
+		member := []ConfigMember(*m)[i]
+		podName, ok := member.Tags["podName"]
+		if !ok {
+			continue
+		}
+		if host, ok := cm[podName]; ok && host != member.Host {
+			changes = true
+			[]ConfigMember(*m)[i].Host = host
+		}
+	}
+
+	return changes
+}
+
+// FixTags corrects the tags of any member if they changed.
+// Especially the "external" tag can change if cluster is switched from
+// unmanaged to managed.
+func (m *ConfigMembers) FixTags(compareWith ConfigMembers) (changes bool) {
+	if len(*m) < 1 {
+		return changes
+	}
+
+	cm := make(map[string]ReplsetTags, len(compareWith))
+
+	for _, member := range compareWith {
+		cm[member.Host] = member.Tags
+	}
+
+	for i := 0; i < len(*m); i++ {
+		member := []ConfigMember(*m)[i]
+		if c, ok := cm[member.Host]; ok && !reflect.DeepEqual(member.Tags, c) {
+			changes = true
+			[]ConfigMember(*m)[i].Tags = c
+		}
+	}
+
+	return changes
+}
+
+// ExternalNodesChanged checks if votes or priority fields changed for external nodes
+func (m *ConfigMembers) ExternalNodesChanged(compareWith ConfigMembers) bool {
+	cm := make(map[string]struct {
+		votes    int
+		priority int
+	}, len(compareWith))
+
+	for _, member := range compareWith {
+		_, ok := member.Tags["external"]
+		if !ok {
+			continue
+		}
+		cm[member.Host] = struct {
+			votes    int
+			priority int
+		}{votes: member.Votes, priority: member.Priority}
+	}
+
+	changes := false
+	for i := 0; i < len(*m); i++ {
+		member := []ConfigMember(*m)[i]
+		if ext, ok := cm[member.Host]; ok {
+			if ext.votes != member.Votes || ext.priority != member.Priority {
+				changes = true
+			}
+			[]ConfigMember(*m)[i].Votes = ext.votes
+			[]ConfigMember(*m)[i].Priority = ext.priority
 		}
 	}
 
@@ -477,20 +670,50 @@ func (m *ConfigMembers) SetVotes() {
 		if member.Hidden {
 			continue
 		}
+
+		if _, ok := member.Tags["external"]; ok {
+			[]ConfigMember(*m)[i].Votes = member.Votes
+			[]ConfigMember(*m)[i].Priority = member.Priority
+
+			if member.Votes == 1 {
+				votes++
+			}
+
+			continue
+		}
+
+		if _, ok := member.Tags["nonVoting"]; ok {
+			// Non voting member is a regular ReplSet member with
+			// votes and priority equals to 0.
+
+			[]ConfigMember(*m)[i].Votes = 0
+			[]ConfigMember(*m)[i].Priority = 0
+
+			continue
+		}
+
 		if votes < MaxVotingMembers {
 			[]ConfigMember(*m)[i].Votes = 1
 			votes++
+
 			if !member.ArbiterOnly {
 				lastVoteIdx = i
-				[]ConfigMember(*m)[i].Priority = 1
+				// Priority can be any number in range [0,1000].
+				// We're setting it to 2 as default, to allow
+				// users to configure external nodes with lower
+				// priority than local nodes.
+				[]ConfigMember(*m)[i].Priority = DefaultPriority
 			}
 		} else if member.ArbiterOnly {
 			// Arbiter should always have a vote
 			[]ConfigMember(*m)[i].Votes = 1
+
+			// We're over the max voters limit. Make room for the arbiter
 			[]ConfigMember(*m)[lastVoteIdx].Votes = 0
 			[]ConfigMember(*m)[lastVoteIdx].Priority = 0
 		}
 	}
+
 	if votes == 0 {
 		return
 	}

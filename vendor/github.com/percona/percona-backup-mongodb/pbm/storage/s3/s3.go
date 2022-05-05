@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,7 +15,11 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -41,9 +46,72 @@ type Conf struct {
 	EndpointURL          string      `bson:"endpointUrl,omitempty" json:"endpointUrl" yaml:"endpointUrl,omitempty"`
 	Bucket               string      `bson:"bucket" json:"bucket" yaml:"bucket"`
 	Prefix               string      `bson:"prefix,omitempty" json:"prefix,omitempty" yaml:"prefix,omitempty"`
-	Credentials          Credentials `bson:"credentials" json:"credentials,omitempty" yaml:"credentials"`
+	Credentials          Credentials `bson:"credentials" json:"-" yaml:"credentials"`
 	ServerSideEncryption *AWSsse     `bson:"serverSideEncryption,omitempty" json:"serverSideEncryption,omitempty" yaml:"serverSideEncryption,omitempty"`
 	UploadPartSize       int         `bson:"uploadPartSize,omitempty" json:"uploadPartSize,omitempty" yaml:"uploadPartSize,omitempty"`
+	MaxUploadParts       int         `bson:"maxUploadParts,omitempty" json:"maxUploadParts,omitempty" yaml:"maxUploadParts,omitempty"`
+	StorageClass         string      `bson:"storageClass,omitempty" json:"storageClass,omitempty" yaml:"storageClass,omitempty"`
+
+	// InsecureSkipTLSVerify disables client verification of the server's
+	// certificate chain and host name
+	InsecureSkipTLSVerify bool `bson:"insecureSkipTLSVerify" json:"insecureSkipTLSVerify" yaml:"insecureSkipTLSVerify"`
+
+	// DebugLogLevels enables AWS SDK debug logging (sub)levels. Available options:
+	// LogDebug, Signing, HTTPBody, RequestRetries, RequestErrors, EventStreamBody
+	//
+	// Any sub levels will enable LogDebug level accordingly to AWS SDK Go module behavior
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go@v1.40.7/aws#LogLevelType
+	DebugLogLevels string `bson:"debugLogLevels,omitempty" json:"debugLogLevels,omitempty" yaml:"debugLogLevels,omitempty"`
+
+	// Retryer is configuration for client.DefaultRetryer
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go/aws/client#DefaultRetryer
+	Retryer *Retryer `bson:"retryer,omitempty" json:"retryer,omitempty" yaml:"retryer,omitempty"`
+}
+
+type Retryer struct {
+	// Num max Retries is the number of max retries that will be performed.
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go/aws/client#DefaultRetryer.NumMaxRetries
+	NumMaxRetries int `bson:"numMaxRetries" json:"numMaxRetries" yaml:"numMaxRetries"`
+
+	// MinRetryDelay is the minimum retry delay after which retry will be performed.
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go/aws/client#DefaultRetryer.MinRetryDelay
+	MinRetryDelay time.Duration `bson:"minRetryDelay" json:"minRetryDelay" yaml:"minRetryDelay"`
+
+	// MaxRetryDelay is the maximum retry delay before which retry must be performed.
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go/aws/client#DefaultRetryer.MaxRetryDelay
+	MaxRetryDelay time.Duration `bson:"maxRetryDelay" json:"maxRetryDelay" yaml:"maxRetryDelay"`
+}
+
+type SDKDebugLogLevel string
+
+const (
+	LogDebug        SDKDebugLogLevel = "LogDebug"
+	Signing         SDKDebugLogLevel = "Signing"
+	HTTPBody        SDKDebugLogLevel = "HTTPBody"
+	RequestRetries  SDKDebugLogLevel = "RequestRetries"
+	RequestErrors   SDKDebugLogLevel = "RequestErrors"
+	EventStreamBody SDKDebugLogLevel = "EventStreamBody"
+)
+
+// SDKLogLevel returns the appropriate AWS SDK debug logging level. If the level
+// is not recognized, returns aws.LogLevelType(0)
+func (l SDKDebugLogLevel) SDKLogLevel() aws.LogLevelType {
+	switch l {
+	case LogDebug:
+		return aws.LogDebug
+	case Signing:
+		return aws.LogDebugWithSigning
+	case HTTPBody:
+		return aws.LogDebugWithHTTPBody
+	case RequestRetries:
+		return aws.LogDebugWithRequestRetries
+	case RequestErrors:
+		return aws.LogDebugWithRequestErrors
+	case EventStreamBody:
+		return aws.LogDebugWithEventStreamBody
+	}
+
+	return aws.LogLevelType(0)
 }
 
 type AWSsse struct {
@@ -67,8 +135,58 @@ func (c *Conf) Cast() error {
 			}
 		}
 	}
+	if c.MaxUploadParts <= 0 {
+		c.MaxUploadParts = s3manager.MaxUploadParts
+	}
+	if c.StorageClass == "" {
+		c.StorageClass = s3.StorageClassStandard
+	}
+
+	if c.Retryer != nil {
+		if c.Retryer.MinRetryDelay == 0 {
+			c.Retryer.MinRetryDelay = client.DefaultRetryerMinRetryDelay
+		}
+		if c.Retryer.MaxRetryDelay == 0 {
+			c.Retryer.MaxRetryDelay = client.DefaultRetryerMaxRetryDelay
+		}
+	}
 
 	return nil
+}
+
+// SDKLogLevel returns AWS SDK log level value from comma-separated
+// SDKDebugLogLevel values string. If the string does not contain a valid value,
+// returns aws.LogOff.
+//
+// If the string is incorrect formatted, prints warnings to the io.Writer.
+// Passing nil as the io.Writer will discard any warnings.
+func SDKLogLevel(levels string, out io.Writer) aws.LogLevelType {
+	if out == nil {
+		out = ioutil.Discard
+	}
+
+	var logLevel aws.LogLevelType
+
+	for _, lvl := range strings.Split(levels, ",") {
+		lvl = strings.TrimSpace(lvl)
+		if lvl == "" {
+			continue
+		}
+
+		l := SDKDebugLogLevel(lvl).SDKLogLevel()
+		if l == 0 {
+			fmt.Fprintf(out, "Warning: S3 client debug log level: unsupported %q\n", lvl)
+			continue
+		}
+
+		logLevel |= l
+	}
+
+	if logLevel == 0 {
+		logLevel = aws.LogOff
+	}
+
+	return logLevel
 }
 
 type Credentials struct {
@@ -92,6 +210,7 @@ const (
 type S3 struct {
 	opts Conf
 	log  *log.Event
+	s3s  *s3.S3
 }
 
 func New(opts Conf, l *log.Event) (*S3, error) {
@@ -100,10 +219,17 @@ func New(opts Conf, l *log.Event) (*S3, error) {
 		return nil, errors.Wrap(err, "cast options")
 	}
 
-	return &S3{
+	s := &S3{
 		opts: opts,
 		log:  l,
-	}, nil
+	}
+
+	s.s3s, err = s.s3session()
+	if err != nil {
+		return nil, errors.Wrap(err, "AWS session")
+	}
+
+	return s, nil
 }
 
 const defaultPartSize = 10 * 1024 * 1024 // 10Mb
@@ -121,9 +247,10 @@ func (s *S3) Save(name string, data io.Reader, sizeb int) error {
 		}
 
 		uplInput := &s3manager.UploadInput{
-			Bucket: aws.String(s.opts.Bucket),
-			Key:    aws.String(path.Join(s.opts.Prefix, name)),
-			Body:   data,
+			Bucket:       aws.String(s.opts.Bucket),
+			Key:          aws.String(path.Join(s.opts.Prefix, name)),
+			Body:         data,
+			StorageClass: &s.opts.StorageClass,
 		}
 
 		sse := s.opts.ServerSideEncryption
@@ -149,7 +276,7 @@ func (s *S3) Save(name string, data io.Reader, sizeb int) error {
 			partSize = s.opts.UploadPartSize
 		}
 		if sizeb > 0 {
-			ps := sizeb / s3manager.MaxUploadParts * 9 / 10 // shed 10% just in case
+			ps := sizeb / s3manager.MaxUploadParts * 11 / 10 // add 10% just in case
 			if ps > partSize {
 				partSize = ps
 			}
@@ -157,13 +284,24 @@ func (s *S3) Save(name string, data io.Reader, sizeb int) error {
 
 		if s.log != nil {
 			s.log.Info("s3.uploadPartSize is set to %d (~%dMb)", partSize, partSize>>20)
+			s.log.Info("s3.maxUploadParts is set to %d", s.opts.MaxUploadParts)
 		}
 
 		_, err = s3manager.NewUploader(awsSession, func(u *s3manager.Uploader) {
-			u.MaxUploadParts = s3manager.MaxUploadParts
+			u.MaxUploadParts = s.opts.MaxUploadParts
 			u.PartSize = int64(partSize) // 10MB part size
 			u.LeavePartsOnError = true   // Don't delete the parts if the upload fails.
 			u.Concurrency = cc
+
+			u.RequestOptions = append(u.RequestOptions, func(r *request.Request) {
+				if s.opts.Retryer != nil {
+					r.Retryer = client.DefaultRetryer{
+						NumMaxRetries: s.opts.Retryer.NumMaxRetries,
+						MinRetryDelay: s.opts.Retryer.MinRetryDelay,
+						MaxRetryDelay: s.opts.Retryer.MaxRetryDelay,
+					}
+				}
+			})
 		}).Upload(uplInput)
 		return errors.Wrap(err, "upload to S3")
 	case S3ProviderGCS:
@@ -173,96 +311,30 @@ func (s *S3) Save(name string, data io.Reader, sizeb int) error {
 		if err != nil {
 			return errors.Wrap(err, "NewWithRegion")
 		}
-		_, err = mc.PutObject(s.opts.Bucket, path.Join(s.opts.Prefix, name), data, -1, minio.PutObjectOptions{})
+		_, err = mc.PutObject(s.opts.Bucket, path.Join(s.opts.Prefix, name), data, -1, minio.PutObjectOptions{
+			StorageClass: s.opts.StorageClass,
+		})
 		return errors.Wrap(err, "upload to GCS")
 	}
 }
 
-func (s *S3) Files(suffix string) ([][]byte, error) {
-	s3s, err := s.s3session()
-	if err != nil {
-		return nil, errors.Wrap(err, "AWS session")
-	}
+func (s *S3) List(prefix, suffix string) ([]storage.FileInfo, error) {
+	prfx := path.Join(s.opts.Prefix, prefix)
 
-	lparams := &s3.ListObjectsInput{
-		Bucket:    aws.String(s.opts.Bucket),
-		Delimiter: aws.String("/"),
-	}
-	if s.opts.Prefix != "" {
-		lparams.Prefix = aws.String(s.opts.Prefix)
-		if s.opts.Prefix[len(s.opts.Prefix)-1] != '/' {
-			*lparams.Prefix += "/"
-		}
-	}
-
-	var bcps [][]byte
-	var berr error
-	err = s3s.ListObjectsPages(lparams,
-		func(page *s3.ListObjectsOutput, lastPage bool) bool {
-			for _, o := range page.Contents {
-				name := aws.StringValue(o.Key)
-				if strings.HasSuffix(name, suffix) {
-					s3obj, err := s3s.GetObject(&s3.GetObjectInput{
-						Bucket: aws.String(s.opts.Bucket),
-						Key:    aws.String(name),
-					})
-					if err != nil {
-						berr = errors.Wrapf(err, "get object '%s'", name)
-						return false
-					}
-
-					sse := s.opts.ServerSideEncryption
-					if sse != nil && sse.SseAlgorithm != "" {
-						s3obj.ServerSideEncryption = aws.String(sse.SseAlgorithm)
-						if sse.SseAlgorithm == s3.ServerSideEncryptionAwsKms {
-							s3obj.SSEKMSKeyId = aws.String(sse.KmsKeyID)
-						}
-					}
-
-					b, err := ioutil.ReadAll(s3obj.Body)
-					if err != nil {
-						berr = errors.Wrapf(err, "read object '%s'", name)
-						return false
-					}
-					bcps = append(bcps, b)
-				}
-			}
-			return true
-		})
-
-	if err != nil {
-		return nil, errors.Wrap(err, "get backup list")
-	}
-
-	if berr != nil {
-		return nil, errors.Wrap(berr, "metadata")
-	}
-
-	return bcps, nil
-}
-
-func (s *S3) List(prefix string) ([]storage.FileInfo, error) {
-	s3s, err := s.s3session()
-	if err != nil {
-		return nil, errors.Wrap(err, "AWS session")
+	if prfx != "" && !strings.HasSuffix(prfx, "/") {
+		prfx = prfx + "/"
 	}
 
 	lparams := &s3.ListObjectsInput{
 		Bucket: aws.String(s.opts.Bucket),
 	}
-	if s.opts.Prefix != "" {
-		lparams.Prefix = aws.String(s.opts.Prefix)
-		if s.opts.Prefix[len(s.opts.Prefix)-1] != '/' {
-			*lparams.Prefix += "/"
-		}
-	}
 
-	if aws.StringValue(lparams.Prefix) != "" || prefix != "" {
-		lparams.Prefix = aws.String(path.Join(aws.StringValue(lparams.Prefix), prefix))
+	if prfx != "" {
+		lparams.Prefix = aws.String(prfx)
 	}
 
 	var files []storage.FileInfo
-	err = s3s.ListObjectsPages(lparams,
+	err := s.s3s.ListObjectsPages(lparams,
 		func(page *s3.ListObjectsOutput, lastPage bool) bool {
 			for _, o := range page.Contents {
 				f := aws.StringValue(o.Key)
@@ -273,14 +345,16 @@ func (s *S3) List(prefix string) ([]storage.FileInfo, error) {
 				if f[0] == '/' {
 					f = f[1:]
 				}
-				files = append(files, storage.FileInfo{
-					Name: f,
-					Size: aws.Int64Value(o.Size),
-				})
+
+				if strings.HasSuffix(f, suffix) {
+					files = append(files, storage.FileInfo{
+						Name: f,
+						Size: aws.Int64Value(o.Size),
+					})
+				}
 			}
 			return true
 		})
-
 	if err != nil {
 		return nil, errors.Wrap(err, "get backup list")
 	}
@@ -288,13 +362,18 @@ func (s *S3) List(prefix string) ([]storage.FileInfo, error) {
 	return files, nil
 }
 
-func (s *S3) FileStat(name string) (inf storage.FileInfo, err error) {
-	s3s, err := s.s3session()
-	if err != nil {
-		return inf, errors.Wrap(err, "AWS session")
-	}
+func (s *S3) Copy(src, dst string) error {
+	_, err := s.s3s.CopyObject(&s3.CopyObjectInput{
+		Bucket:     aws.String(s.opts.Bucket),
+		CopySource: aws.String(path.Join(s.opts.Bucket, s.opts.Prefix, src)),
+		Key:        aws.String(path.Join(s.opts.Prefix, dst)),
+	})
 
-	h, err := s3s.HeadObject(&s3.HeadObjectInput{
+	return err
+}
+
+func (s *S3) FileStat(name string) (inf storage.FileInfo, err error) {
+	h, err := s.s3s.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(s.opts.Bucket),
 		Key:    aws.String(path.Join(s.opts.Prefix, name)),
 	})
@@ -309,7 +388,7 @@ func (s *S3) FileStat(name string) (inf storage.FileInfo, err error) {
 	inf.Size = aws.Int64Value(h.ContentLength)
 
 	if inf.Size == 0 {
-		return inf, errors.New("file empty")
+		return inf, storage.ErrEmpty
 	}
 	if aws.BoolValue(h.DeleteMarker) {
 		return inf, errors.New("file has delete marker")
@@ -344,7 +423,7 @@ func (s *S3) newPartReader(fname string) *partReader {
 }
 
 func (pr *partReader) setSession(s *s3.S3) {
-	s.Client.Config.HTTPClient.Timeout = time.Second * 30
+	s.Client.Config.HTTPClient.Timeout = time.Second * 60
 	pr.sess = s
 }
 
@@ -373,7 +452,6 @@ func (pr *partReader) writeNext(w io.Writer) (n int64, err error) {
 		Key:    aws.String(path.Join(pr.opts.Prefix, pr.fname)),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", pr.n, pr.n+downloadChuckSize-1)),
 	})
-
 	if err != nil {
 		// if object size is undefined, we would read
 		// until HTTP code 416 (Requested Range Not Satisfiable)
@@ -407,8 +485,16 @@ func (pr *partReader) writeNext(w io.Writer) (n int64, err error) {
 		return 0, io.EOF
 	}
 
+	// The last chunk during the PITR restore usually won't be read fully
+	// (high chances that the targeted time will be in the middle of the chunk)
+	// so in this case the reader (oplog.Apply) will close the pipe once reaching the
+	// targeted time.
+	if err != nil && errors.Is(err, io.ErrClosedPipe) {
+		return n, nil
+	}
+
 	if err != nil {
-		pr.l.Warning("errReadObj Err: %v", err)
+		pr.l.Warning("io.copy: %v", err)
 		return n, errReadObj(err)
 	}
 
@@ -446,23 +532,19 @@ func (pr *partReader) setSize(o *s3.GetObjectOutput) {
 // If it fails to do so or connection error happened, it recreates the session
 // and tries again up to `downloadRetries` times.
 func (s *S3) SourceReader(name string) (io.ReadCloser, error) {
-	s3s, err := s.s3session()
-	if err != nil {
-		return nil, errors.Wrap(err, "AWS session")
-	}
-
 	pr := s.newPartReader(name)
-	pr.setSession(s3s)
+	pr.setSession(s.s3s)
 
 	r, w := io.Pipe()
 
 	go func() {
 		defer w.Close()
 
+		var err error
 	Loop:
 		for {
 			for i := 0; i < downloadRetries; i++ {
-				_, err := pr.tryNext(w)
+				_, err = pr.tryNext(w)
 				if err == nil {
 					continue Loop
 				}
@@ -470,7 +552,7 @@ func (s *S3) SourceReader(name string) (io.ReadCloser, error) {
 					return
 				}
 				if errors.Is(err, io.ErrClosedPipe) {
-					s.log.Warning("reader closed pipe, stopping download")
+					s.log.Info("reader closed pipe, stopping download")
 					return
 				}
 
@@ -485,6 +567,7 @@ func (s *S3) SourceReader(name string) (io.ReadCloser, error) {
 				s.log.Info("session recreated, resuming download")
 			}
 			s.log.Error("download '%s/%s' file from S3: %v", s.opts.Bucket, name, err)
+			w.CloseWithError(errors.Wrapf(err, "download '%s/%s'", s.opts.Bucket, name))
 			return
 		}
 	}()
@@ -495,15 +578,10 @@ func (s *S3) SourceReader(name string) (io.ReadCloser, error) {
 // Delete deletes given file.
 // It returns storage.ErrNotExist if a file isn't exists
 func (s *S3) Delete(name string) error {
-	s3s, err := s.s3session()
-	if err != nil {
-		return errors.Wrap(err, "AWS session")
-	}
-	_, err = s3s.DeleteObject(&s3.DeleteObjectInput{
+	_, err := s.s3s.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(s.opts.Bucket),
 		Key:    aws.String(path.Join(s.opts.Prefix, name)),
 	})
-
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			switch aerr.Code() {
@@ -527,14 +605,58 @@ func (s *S3) s3session() (*s3.S3, error) {
 }
 
 func (s *S3) session() (*session.Session, error) {
+	var providers []credentials.Provider
+
+	// if we have credentials, set them first in the providers list
+	if s.opts.Credentials.AccessKeyID != "" && s.opts.Credentials.SecretAccessKey != "" {
+		providers = append(providers, &credentials.StaticProvider{Value: credentials.Value{
+			AccessKeyID:     s.opts.Credentials.AccessKeyID,
+			SecretAccessKey: s.opts.Credentials.SecretAccessKey,
+			SessionToken:    "",
+		}})
+	}
+
+	// allow fetching credentials from env variables and ec2 metadata endpoint
+	providers = append(providers, &credentials.EnvProvider{})
+	providers = append(providers, &ec2rolecreds.EC2RoleProvider{
+		Client: ec2metadata.New(session.New()),
+	})
+
+	httpClient := http.DefaultClient
+	if s.opts.InsecureSkipTLSVerify {
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+	}
+
 	return session.NewSession(&aws.Config{
-		Region:   aws.String(s.opts.Region),
-		Endpoint: aws.String(s.opts.EndpointURL),
-		Credentials: credentials.NewStaticCredentials(
-			s.opts.Credentials.AccessKeyID,
-			s.opts.Credentials.SecretAccessKey,
-			"",
-		),
+		Region:           aws.String(s.opts.Region),
+		Endpoint:         aws.String(s.opts.EndpointURL),
+		Credentials:      credentials.NewChainCredentials(providers),
 		S3ForcePathStyle: aws.Bool(true),
+		HTTPClient:       httpClient,
+		LogLevel:         aws.LogLevel(SDKLogLevel(s.opts.DebugLogLevels, nil)),
+		Logger:           awsLogger(s.log),
+	})
+}
+
+func awsLogger(l *log.Event) aws.Logger {
+	if l == nil {
+		return aws.NewDefaultLogger()
+	}
+
+	return aws.LoggerFunc(func(xs ...interface{}) {
+		if len(xs) == 0 {
+			return
+		}
+
+		msg := "%v"
+		for i := len(xs) - 1; i != 0; i++ {
+			msg += " %v"
+		}
+
+		l.Debug(msg, xs...)
 	})
 }

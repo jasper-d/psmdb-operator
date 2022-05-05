@@ -14,24 +14,36 @@ deploy_operator
 desc 'install PMM Server'
 platform=kubernetes
 
-helm del --purge monitoring || :
+helm uninstall monitoring || :
 helm repo remove stable || :
 helm repo add stable https://charts.helm.sh/stable
-if [[ -n "${OPENSHIFT}" ]]; then
-    platform=openshift
-    oc adm policy add-scc-to-user privileged -z percona-server-mongodb-operator
-    oc patch role/percona-server-mongodb-operator --type json -p='[{"op":"add","path": "/rules/-","value":{"apiGroups":["security.openshift.io"],"resources":["securitycontextconstraints"],"verbs":["use"],"resourceNames":["privileged"]}}]'
-    retry 10 60 helm install monitoring --set platform=$platform --set sa=percona-server-mongodb-operator --set supresshttp2=false https://percona-charts.storage.googleapis.com/pmm-server-2.12.4.tgz
+if [[ -n ${OPENSHIFT} ]]; then
+	platform=openshift
+	oc adm policy add-scc-to-user privileged -z percona-server-mongodb-operator
+	oc patch role/percona-server-mongodb-operator --type json -p='[{"op":"add","path": "/rules/-","value":{"apiGroups":["security.openshift.io"],"resources":["securitycontextconstraints"],"verbs":["use"],"resourceNames":["privileged"]}}]'
+	retry 10 60 helm install monitoring --set imageTag=$IMAGE_PMM_SERVER_TAG --set imageRepo=$IMAGE_PMM_SERVER_REPO --set platform=$platform --set sa=percona-server-mongodb-operator --set supresshttp2=false https://percona-charts.storage.googleapis.com/pmm-server-${PMM_SERVER_VER}.tgz
 else
-    retry 10 60 helm install monitoring --set platform=$platform https://percona-charts.storage.googleapis.com/pmm-server-2.12.4.tgz
+	retry 10 60 helm install monitoring --set imageTag=$IMAGE_PMM_SERVER_TAG --set imageRepo=$IMAGE_PMM_SERVER_REPO --set platform=$platform https://percona-charts.storage.googleapis.com/pmm-server-${PMM_SERVER_VER}.tgz
 fi
 sleep 20
+SERVICE="postgres"
+until kubectl_bin exec monitoring-0 -- bash -c "pgrep -x $SERVICE >/dev/null"; do
+	echo "Retry $retry"
+	sleep 5
+	let retry+=1
+	if [ $retry -ge 20 ]; then
+		echo "Max retry count $retry reached. Pmm-server can't start"
+		exit 1
+	fi
+done
+ADMIN_PASSWORD=$(kubectl_bin exec monitoring-0 -- bash -c "printenv | grep ADMIN_PASSWORD | cut -d '=' -f2")
+kubectl_bin exec monitoring-0 -- bash -c "grafana-cli --homepath=/usr/share/grafana --config=/etc/grafana/grafana.ini admin reset-admin-password $ADMIN_PASSWORD"
 
 desc 'create PSMDB cluster'
 kubectl_bin apply \
-    -f $conf_dir/secrets.yml \
-    -f $conf_dir/client.yml \
-    -f $test_dir/conf/secrets.yml
+	-f $conf_dir/secrets.yml \
+	-f $conf_dir/client.yml \
+	-f $test_dir/conf/secrets.yml
 
 apply_cluster $test_dir/conf/$cluster-rs0.yml
 desc 'check if all 3 Pods started'
@@ -43,7 +55,7 @@ desc 'check if pmm-client container enabled'
 compare_kubectl statefulset/$cluster-rs0
 compare_kubectl service/$cluster-rs0
 compare_kubectl statefulset/$cluster-cfg
-compare_kubectl deployment/$cluster-mongos
+compare_kubectl statefulset/$cluster-mongos
 
 desc 'check mongod metrics'
 get_metric_values node_boot_time_seconds $namespace-$cluster-rs0-1 admin:admin
@@ -66,9 +78,9 @@ get_qan20_values $cluster-rs0-0 admin:admin
 get_qan20_values $cluster-cfg-0 admin:admin
 get_qan20_values $MONGOS_POD_NAME admin:admin
 
-if [[ -n "${OPENSHIFT}" ]]; then
-    oc adm policy remove-scc-from-user privileged -z percona-server-mongodb-operator
+if [[ -n ${OPENSHIFT} ]]; then
+	oc adm policy remove-scc-from-user privileged -z percona-server-mongodb-operator
 fi
 
-helm delete monitoring
+helm uninstall monitoring
 destroy $namespace

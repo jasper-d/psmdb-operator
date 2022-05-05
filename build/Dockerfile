@@ -1,4 +1,4 @@
-FROM golang:1.16 AS go_builder
+FROM golang:1.17 AS go_builder
 WORKDIR /go/src/github.com/percona/percona-server-mongodb-operator
 
 COPY . .
@@ -54,7 +54,7 @@ USER psmdb-user:psmdb-user
 
 ENTRYPOINT ["/usr/local/bin/percona-server-mongodb-webhook"]
 
-FROM registry.access.redhat.com/ubi7/ubi-minimal AS ubi7
+FROM registry.access.redhat.com/ubi8/ubi-minimal AS ubi8
 RUN microdnf update && microdnf clean all
 
 LABEL name="Percona Server for MongoDB Operator" \
@@ -72,6 +72,6 @@ COPY build/ps-entry.sh /ps-entry.sh
 # Mozilla licensed source code should be included
 COPY vendor/github.com/hashicorp /lib
 
-USER nobody
+USER 2
 
 

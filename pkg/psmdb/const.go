@@ -1,9 +1,14 @@
 package psmdb
 
 import (
+	"crypto/md5"
+	"encoding/json"
+	"fmt"
+
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -15,19 +20,22 @@ const (
 	// MongodContainerDataDir is a mondo data path in container
 	MongodContainerDataDir = "/data/db"
 
-	sslDir               = "/etc/mongodb-ssl"
-	sslInternalDir       = "/etc/mongodb-ssl-internal"
-	mongodConfigDir      = "/etc/mongodb-config"
-	mongosConfigDir      = "/etc/mongos-config"
-	mongodSecretsDir     = "/etc/mongodb-secrets"
-	mongodRESTencryptDir = "/etc/mongodb-encryption"
-	EncryptionKeyName    = "encryption-key"
-	mongodPortName       = "mongodb"
-	mongosPortName       = "mongos"
+	sslDir           = "/etc/mongodb-ssl"
+	sslInternalDir   = "/etc/mongodb-ssl-internal"
+	mongodConfigDir  = "/etc/mongodb-config"
+	mongosConfigDir  = "/etc/mongos-config"
+	mongodSecretsDir = "/etc/mongodb-secrets"
+	mongodPortName   = "mongodb"
+	mongosPortName   = "mongos"
 )
 
 func InternalKey(cr *api.PerconaServerMongoDB) string {
 	return cr.Name + "-mongodb-keyfile"
+}
+
+type CustomConfig struct {
+	Type    VolumeSourceType
+	HashHex string
 }
 
 type VolumeSourceType int
@@ -77,13 +85,61 @@ func (s VolumeSourceType) VolumeSource(name string) corev1.VolumeSource {
 	}
 }
 
-func VolumeSourceTypeToObj(s VolumeSourceType) runtime.Object {
+type HashableObject interface {
+	GetRuntimeObject() client.Object
+	GetHashHex() (string, error)
+}
+
+func VolumeSourceTypeToObj(s VolumeSourceType) HashableObject {
 	switch s {
 	case VolumeSourceConfigMap:
-		return &corev1.ConfigMap{}
+		return &hashableConfigMap{}
 	case VolumeSourceSecret:
-		return &corev1.Secret{}
+		return &hashableSecret{}
 	default:
 		return nil
 	}
+}
+
+type hashableConfigMap struct {
+	corev1.ConfigMap
+}
+
+func (cm *hashableConfigMap) GetRuntimeObject() client.Object {
+	return &cm.ConfigMap
+}
+
+func (cm *hashableConfigMap) GetHashHex() (string, error) {
+	return getCustomConfigHashHex(cm.Data, cm.BinaryData)
+}
+
+type hashableSecret struct {
+	corev1.Secret
+}
+
+func (s *hashableSecret) GetRuntimeObject() client.Object {
+	return &s.Secret
+}
+
+func (s *hashableSecret) GetHashHex() (string, error) {
+	return getCustomConfigHashHex(s.StringData, s.Data)
+}
+
+func getCustomConfigHashHex(strData map[string]string, binData map[string][]byte) (string, error) {
+	var content = struct {
+		StrData map[string]string `json:"str_data,omitempty"`
+		BinData map[string][]byte `json:"bin_data,omitempty"`
+	}{
+		StrData: strData,
+		BinData: binData,
+	}
+
+	allData, err := json.Marshal(content)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to concat data for config hash")
+	}
+
+	hashHex := fmt.Sprintf("%x", md5.Sum(allData))
+
+	return hashHex, nil
 }

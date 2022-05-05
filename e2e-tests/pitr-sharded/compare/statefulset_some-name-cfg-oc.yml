@@ -64,20 +64,9 @@ spec:
             - --sslMode=preferSSL
             - --clusterAuthMode=x509
             - --configsvr
-            - --slowms=100
-            - --profile=1
-            - --rateLimit=1
             - --enableEncryption
             - --encryptionKeyFile=/etc/mongodb-encryption/encryption-key
-            - --wiredTigerCollectionBlockCompressor=snappy
-            - --wiredTigerJournalCompressor=snappy
             - --wiredTigerIndexPrefixCompression=true
-            - --setParameter
-            - ttlMonitorSleepSecs=60
-            - --setParameter
-            - wiredTigerConcurrentReadTransactions=128
-            - --setParameter
-            - wiredTigerConcurrentWriteTransactions=128
           command:
             - /data/db/ps-entry.sh
           env:
@@ -110,14 +99,14 @@ spec:
             initialDelaySeconds: 60
             periodSeconds: 30
             successThreshold: 1
-            timeoutSeconds: 5
+            timeoutSeconds: 10
           name: mongod
           ports:
             - containerPort: 27017
               name: mongodb
               protocol: TCP
           readinessProbe:
-            failureThreshold: 8
+            failureThreshold: 3
             initialDelaySeconds: 10
             periodSeconds: 3
             successThreshold: 1

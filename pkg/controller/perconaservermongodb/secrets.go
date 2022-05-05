@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"net/url"
 
-	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
-	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/secret"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb"
+	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/secret"
 )
 
 const (
@@ -36,24 +38,19 @@ const (
 	roleBackup         UserRole = "backup"
 )
 
-func (r *ReconcilePerconaServerMongoDB) getUserSecret(cr *api.PerconaServerMongoDB, name string) (corev1.Secret, error) {
+func (r *ReconcilePerconaServerMongoDB) getUserSecret(ctx context.Context, cr *api.PerconaServerMongoDB, name string) (corev1.Secret, error) {
 	secrets := corev1.Secret{}
-	err := r.client.Get(
-		context.TODO(),
-		types.NamespacedName{Name: name, Namespace: cr.Namespace},
-		&secrets,
-	)
-
+	err := r.client.Get(ctx, types.NamespacedName{Name: name, Namespace: cr.Namespace}, &secrets)
 	return secrets, errors.Wrap(err, "get user secrets")
 }
 
-func (r *ReconcilePerconaServerMongoDB) getInternalCredentials(cr *api.PerconaServerMongoDB, role UserRole) (Credentials, error) {
-	return r.getCredentials(cr, api.UserSecretName(cr), role)
+func (r *ReconcilePerconaServerMongoDB) getInternalCredentials(ctx context.Context, cr *api.PerconaServerMongoDB, role UserRole) (psmdb.Credentials, error) {
+	return r.getCredentials(ctx, cr, api.UserSecretName(cr), role)
 }
 
-func (r *ReconcilePerconaServerMongoDB) getCredentials(cr *api.PerconaServerMongoDB, name string, role UserRole) (Credentials, error) {
-	creds := Credentials{}
-	usersSecret, err := r.getUserSecret(cr, name)
+func (r *ReconcilePerconaServerMongoDB) getCredentials(ctx context.Context, cr *api.PerconaServerMongoDB, name string, role UserRole) (psmdb.Credentials, error) {
+	creds := psmdb.Credentials{}
+	usersSecret, err := r.getUserSecret(ctx, cr, name)
 	if err != nil {
 		return creds, errors.Wrap(err, "failed to get user secret")
 	}
@@ -75,14 +72,12 @@ func (r *ReconcilePerconaServerMongoDB) getCredentials(cr *api.PerconaServerMong
 		return creds, errors.Errorf("not implemented for role: %s", role)
 	}
 
-	creds.Password = url.QueryEscape(creds.Password)
-
 	return creds, nil
 }
 
-func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(cr *api.PerconaServerMongoDB) error {
+func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(ctx context.Context, cr *api.PerconaServerMongoDB) error {
 	secretObj := corev1.Secret{}
-	err := r.client.Get(context.TODO(),
+	err := r.client.Get(ctx,
 		types.NamespacedName{
 			Namespace: cr.Namespace,
 			Name:      cr.Spec.Secrets.Users,
@@ -90,9 +85,24 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(cr *api.PerconaServ
 		&secretObj,
 	)
 	if err == nil {
-		return nil
+		if cr.CompareVersion("1.2.0") < 0 {
+			shouldUpdate := false
+			for _, v := range []string{envMongoDBClusterMonitorUser, envMongoDBClusterMonitorPassword} {
+				escaped, ok := secretObj.Data[v+"_ESCAPED"]
+				if !ok || url.QueryEscape(string(secretObj.Data[v])) != string(escaped) {
+					secretObj.Data[v+"_ESCAPED"] = []byte(url.QueryEscape(string(secretObj.Data[v])))
+					shouldUpdate = true
+				}
+			}
+			if shouldUpdate {
+				err = r.client.Update(ctx, &secretObj)
+			}
+		}
+		return errors.Wrap(err, "escape users secret")
+	} else if k8serrors.IsNotFound(err) && cr.Spec.Unmanaged {
+		return errors.Errorf("users secret '%s' is required for unmanaged clusters", cr.Spec.Secrets.Users)
 	} else if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("get users secret: %v", err)
+		return errors.Wrap(err, "get users secret")
 	}
 
 	data := make(map[string][]byte)
@@ -111,6 +121,9 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(cr *api.PerconaServ
 	if err != nil {
 		return fmt.Errorf("create cluster monitor users pass: %v", err)
 	}
+	if cr.CompareVersion("1.2.0") < 0 {
+		data["MONGODB_CLUSTER_MONITOR_PASSWORD_ESCAPED"] = []byte(url.QueryEscape(string(data["MONGODB_CLUSTER_MONITOR_PASSWORD"])))
+	}
 	data["MONGODB_USER_ADMIN_USER"] = []byte(roleUserAdmin)
 	data["MONGODB_USER_ADMIN_PASSWORD"], err = secret.GeneratePassword()
 	if err != nil {
@@ -125,15 +138,10 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(cr *api.PerconaServ
 		Data: data,
 		Type: corev1.SecretTypeOpaque,
 	}
-	err = r.client.Create(context.TODO(), &secretObj)
+	err = r.client.Create(ctx, &secretObj)
 	if err != nil {
 		return fmt.Errorf("create Users secret: %v", err)
 	}
 
 	return nil
-}
-
-type Credentials struct {
-	Username string
-	Password string
 }

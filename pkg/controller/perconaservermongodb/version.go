@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	v "github.com/hashicorp/go-version"
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
@@ -14,6 +13,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func (r *ReconcilePerconaServerMongoDB) deleteEnsureVersion(cr *api.PerconaServerMongoDB, id int) {
@@ -21,7 +22,7 @@ func (r *ReconcilePerconaServerMongoDB) deleteEnsureVersion(cr *api.PerconaServe
 	delete(r.crons.jobs, jobName(cr))
 }
 
-func (r *ReconcilePerconaServerMongoDB) sheduleEnsureVersion(cr *api.PerconaServerMongoDB, vs VersionService) error {
+func (r *ReconcilePerconaServerMongoDB) sheduleEnsureVersion(ctx context.Context, cr *api.PerconaServerMongoDB, vs VersionService) error {
 	schedule, ok := r.crons.jobs[jobName(cr)]
 	if cr.Spec.UpdateStrategy != v1.SmartUpdateStatefulSetStrategyType ||
 		cr.Spec.UpgradeOptions.Schedule == "" ||
@@ -59,7 +60,7 @@ func (r *ReconcilePerconaServerMongoDB) sheduleEnsureVersion(cr *api.PerconaServ
 		}
 
 		localCr := &api.PerconaServerMongoDB{}
-		err := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, localCr)
+		err := r.client.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, localCr)
 		if err != nil {
 			log.Error(err, "failed to get CR")
 			return
@@ -76,7 +77,7 @@ func (r *ReconcilePerconaServerMongoDB) sheduleEnsureVersion(cr *api.PerconaServ
 			return
 		}
 
-		err = r.ensureVersion(localCr, vs)
+		err = r.ensureVersion(ctx, localCr, vs)
 		if err != nil {
 			log.Error(err, "failed to ensure version")
 		}
@@ -118,6 +119,8 @@ func canUpgradeVersion(fcv, new string) bool {
 		return new == "4.2"
 	case "4.2":
 		return new == "4.4"
+	case "4.4":
+		return new == "5.0"
 	default:
 		return false
 	}
@@ -187,7 +190,7 @@ func majorUpgradeRequested(cr *api.PerconaServerMongoDB, fcv string) (UpgradeReq
 
 	if newMM < mongoMM {
 		if newMM != fcv {
-			return UpgradeRequest{false, "", ""}, errors.Errorf("can't upgrade to %s wits FCV set to %s", ver, fcv)
+			return UpgradeRequest{false, "", ""}, errors.Errorf("can't upgrade to %s with FCV set to %s", ver, fcv)
 		}
 
 		return UpgradeRequest{true, apply, ver}, nil
@@ -196,7 +199,7 @@ func majorUpgradeRequested(cr *api.PerconaServerMongoDB, fcv string) (UpgradeReq
 	return UpgradeRequest{false, "", ""}, nil
 }
 
-func (r *ReconcilePerconaServerMongoDB) ensureVersion(cr *api.PerconaServerMongoDB, vs VersionService) error {
+func (r *ReconcilePerconaServerMongoDB) ensureVersion(ctx context.Context, cr *api.PerconaServerMongoDB, vs VersionService) error {
 	if cr.Spec.UpdateStrategy != v1.SmartUpdateStatefulSetStrategyType ||
 		cr.Spec.UpgradeOptions.Schedule == "" ||
 		cr.Spec.UpgradeOptions.Apply.Lower() == api.UpgradeStrategyNever ||
@@ -210,7 +213,7 @@ func (r *ReconcilePerconaServerMongoDB) ensureVersion(cr *api.PerconaServerMongo
 
 	fcv := ""
 	if cr.Status.MongoVersion != "" {
-		f, err := r.getFCV(cr)
+		f, err := r.getFCV(ctx, cr)
 		if err != nil {
 			return errors.Wrap(err, "failed to get FCV")
 		}
@@ -245,6 +248,7 @@ func (r *ReconcilePerconaServerMongoDB) ensureVersion(cr *api.PerconaServerMongo
 		}
 	}
 
+	patch := client.MergeFrom(cr.DeepCopy())
 	newVersion, err := vs.GetExactVersion(cr.Spec.UpgradeOptions.VersionServiceEndpoint, vm)
 	if err != nil {
 		return errors.Wrap(err, "failed to check version")
@@ -277,21 +281,9 @@ func (r *ReconcilePerconaServerMongoDB) ensureVersion(cr *api.PerconaServerMongo
 		cr.Spec.PMM.Image = newVersion.PMMImage
 	}
 
-	err = r.client.Update(context.Background(), cr)
+	err = r.client.Patch(ctx, cr, patch)
 	if err != nil {
-		return fmt.Errorf("failed to update CR: %v", err)
-	}
-
-	time.Sleep(1 * time.Second) // based on experiments operator just need it.
-
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, cr)
-	if err != nil {
-		return fmt.Errorf("failed to get CR: %v", err)
-	}
-
-	err = cr.CheckNSetDefaults(r.serverVersion.Platform, log)
-	if err != nil {
-		return fmt.Errorf("failed to set defaults for CR: %v", err)
+		return errors.Wrap(err, "failed to update CR")
 	}
 
 	cr.Status.PMMVersion = newVersion.PMMVersion
@@ -299,37 +291,43 @@ func (r *ReconcilePerconaServerMongoDB) ensureVersion(cr *api.PerconaServerMongo
 	cr.Status.MongoVersion = newVersion.MongoVersion
 	cr.Status.MongoImage = newVersion.MongoImage
 
-	err = r.client.Status().Update(context.Background(), cr)
-	if err != nil {
-		return fmt.Errorf("failed to update CR status: %v", err)
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		c := &api.PerconaServerMongoDB{}
 
-	time.Sleep(1 * time.Second)
+		err := r.client.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, c)
+		if err != nil {
+			return err
+		}
 
-	return nil
+		c.Status.PMMVersion = newVersion.PMMVersion
+		c.Status.BackupVersion = newVersion.BackupVersion
+		c.Status.MongoVersion = newVersion.MongoVersion
+		c.Status.MongoImage = newVersion.MongoImage
+
+		return r.client.Status().Update(ctx, c)
+	})
 }
 
-func (r *ReconcilePerconaServerMongoDB) fetchVersionFromMongo(cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec) error {
-
+func (r *ReconcilePerconaServerMongoDB) fetchVersionFromMongo(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec) error {
 	if cr.Status.ObservedGeneration != cr.ObjectMeta.Generation ||
 		cr.Status.State != api.AppStateReady ||
 		cr.Status.MongoImage == cr.Spec.Image {
 		return nil
 	}
 
-	session, err := r.mongoClientWithRole(cr, *replset, roleClusterAdmin)
+	session, err := r.mongoClientWithRole(ctx, cr, *replset, roleClusterAdmin)
 	if err != nil {
 		return errors.Wrap(err, "dial")
 	}
 
 	defer func() {
-		err := session.Disconnect(context.TODO())
+		err := session.Disconnect(ctx)
 		if err != nil {
 			log.Error(err, "failed to close connection")
 		}
 	}()
 
-	info, err := mongo.RSBuildInfo(context.Background(), session)
+	info, err := mongo.RSBuildInfo(ctx, session)
 	if err != nil {
 		return errors.Wrap(err, "get build info")
 	}
@@ -339,6 +337,6 @@ func (r *ReconcilePerconaServerMongoDB) fetchVersionFromMongo(cr *api.PerconaSer
 	cr.Status.MongoImage = cr.Spec.Image
 
 	// updating status resets our defaults, so we're passing a copy
-	err = r.client.Status().Update(context.Background(), cr.DeepCopy())
+	err = r.client.Status().Update(ctx, cr.DeepCopy())
 	return errors.Wrapf(err, "failed to update CR")
 }

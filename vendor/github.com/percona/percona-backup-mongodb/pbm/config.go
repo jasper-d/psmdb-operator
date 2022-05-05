@@ -1,6 +1,8 @@
 package pbm
 
 import (
+	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/percona/percona-backup-mongodb/pbm/log"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
+	"github.com/percona/percona-backup-mongodb/pbm/storage/azure"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/blackhole"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/fs"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/s3"
@@ -25,12 +28,49 @@ type Config struct {
 	PITR    PITRConf            `bson:"pitr" json:"pitr" yaml:"pitr"`
 	Storage StorageConf         `bson:"storage" json:"storage" yaml:"storage"`
 	Restore RestoreConf         `bson:"restore" json:"restore,omitempty" yaml:"restore,omitempty"`
+	Backup  BackupConf          `bson:"backup" json:"backup,omitempty" yaml:"backup,omitempty"`
 	Epoch   primitive.Timestamp `bson:"epoch" json:"-" yaml:"-"`
+}
+
+func (c Config) String() string {
+	if c.Storage.S3.Credentials.AccessKeyID != "" {
+		c.Storage.S3.Credentials.AccessKeyID = "***"
+	}
+	if c.Storage.S3.Credentials.SecretAccessKey != "" {
+		c.Storage.S3.Credentials.SecretAccessKey = "***"
+	}
+	if c.Storage.S3.Credentials.Vault.Secret != "" {
+		c.Storage.S3.Credentials.Vault.Secret = "***"
+	}
+	if c.Storage.S3.Credentials.Vault.Token != "" {
+		c.Storage.S3.Credentials.Vault.Token = "***"
+	}
+	if c.Storage.Azure.Credentials.Key != "" {
+		c.Storage.Azure.Credentials.Key = "***"
+	}
+
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Sprintln("error:", err)
+	}
+
+	return string(b)
 }
 
 // PITRConf is a Point-In-Time Recovery options
 type PITRConf struct {
-	Enabled bool `bson:"enabled" json:"enabled" yaml:"enabled"`
+	Enabled          bool            `bson:"enabled" json:"enabled" yaml:"enabled"`
+	OplogSpanMin     float64         `bson:"oplogSpanMin" json:"oplogSpanMin" yaml:"oplogSpanMin"`
+	Compression      CompressionType `bson:"compression,omitempty" json:"compression,omitempty" yaml:"compression,omitempty"`
+	CompressionLevel *int            `bson:"compressionLevel,omitempty" json:"compressionLevel,omitempty" yaml:"compressionLevel,omitempty"`
+}
+
+func (c *PITRConf) Cast() error {
+	if c.Compression == "" {
+		c.Compression = CompressionTypeS2
+	}
+
+	return nil
 }
 
 // StorageType represents a type of the destination storage for backups
@@ -39,6 +79,7 @@ type StorageType string
 const (
 	StorageUndef      StorageType = ""
 	StorageS3         StorageType = "s3"
+	StorageAzure      StorageType = "azure"
 	StorageFilesystem StorageType = "filesystem"
 	StorageBlackHole  StorageType = "blackhole"
 )
@@ -47,13 +88,59 @@ const (
 type StorageConf struct {
 	Type       StorageType `bson:"type" json:"type" yaml:"type"`
 	S3         s3.Conf     `bson:"s3,omitempty" json:"s3,omitempty" yaml:"s3,omitempty"`
+	Azure      azure.Conf  `bson:"azure,omitempty" json:"azure,omitempty" yaml:"azure,omitempty"`
 	Filesystem fs.Conf     `bson:"filesystem,omitempty" json:"filesystem,omitempty" yaml:"filesystem,omitempty"`
+}
+
+func (s *StorageConf) Typ() string {
+	switch s.Type {
+	case StorageS3:
+		return "S3"
+	case StorageAzure:
+		return "Azure"
+	case StorageFilesystem:
+		return "FS"
+	case StorageBlackHole:
+		return "BlackHole"
+	default:
+		return "Unknown"
+	}
+}
+
+func (s *StorageConf) Path() string {
+	path := ""
+	switch s.Type {
+	case StorageS3:
+		path = "s3://"
+		if s.S3.EndpointURL != "" {
+			path += s.S3.EndpointURL + "/"
+		}
+		path += s.S3.Bucket
+		if s.S3.Prefix != "" {
+			path += "/" + s.S3.Prefix
+		}
+	case StorageAzure:
+		path = fmt.Sprintf(azure.BlobURL, s.Azure.Account, s.Azure.Container)
+		if s.Azure.Prefix != "" {
+			path += "/" + s.Azure.Prefix
+		}
+	case StorageFilesystem:
+		path = s.Filesystem.Path
+	case StorageBlackHole:
+		path = "BlackHole"
+	}
+
+	return path
 }
 
 // RestoreConf is config options for the restore
 type RestoreConf struct {
 	BatchSize           int `bson:"batchSize" json:"batchSize,omitempty" yaml:"batchSize,omitempty"` // num of documents to buffer
 	NumInsertionWorkers int `bson:"numInsertionWorkers" json:"numInsertionWorkers,omitempty" yaml:"numInsertionWorkers,omitempty"`
+}
+
+type BackupConf struct {
+	Priority map[string]float64 `bson:"priority,omitempty" json:"priority,omitempty" yaml:"priority,omitempty"`
 }
 
 type confMap map[string]reflect.Kind
@@ -96,12 +183,27 @@ func (p *PBM) SetConfigByte(buf []byte) error {
 }
 
 func (p *PBM) SetConfig(cfg Config) error {
-	if cfg.Storage.Type == StorageS3 {
+	switch cfg.Storage.Type {
+	case StorageS3:
 		err := cfg.Storage.S3.Cast()
 		if err != nil {
 			return errors.Wrap(err, "cast storage")
 		}
+
+		// call the function for notification purpose.
+		// warning about unsupported levels will be printed
+		s3.SDKLogLevel(cfg.Storage.S3.DebugLogLevels, os.Stderr)
+	case StorageFilesystem:
+		err := cfg.Storage.Filesystem.Cast()
+		if err != nil {
+			return errors.Wrap(err, "check config")
+		}
 	}
+
+	if c := string(cfg.PITR.Compression); c != "" && !isValidCompressionType(c) {
+		return errors.Errorf("unsupported compression type: %q", c)
+	}
+
 	ct, err := p.ClusterTime()
 	if err != nil {
 		return errors.Wrap(err, "get cluster time")
@@ -130,8 +232,8 @@ func (p *PBM) SetConfigVar(key, val string) error {
 	// just check if config was set
 	_, err := p.GetConfig()
 	if err != nil {
-		if errors.Cause(err) == mongo.ErrNoDocuments {
-			return errors.New("config doesn't set")
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return errors.New("config is not set")
 		}
 		return err
 	}
@@ -152,14 +254,47 @@ func (p *PBM) SetConfigVar(key, val string) error {
 	}
 
 	// TODO: how to be with special case options like pitr.enabled
-	if key == "pitr.enabled" {
+	switch key {
+	case "pitr.enabled":
 		return errors.Wrap(p.confSetPITR(key, v.(bool)), "write to db")
+	case "pitr.compression":
+		if c := v.(string); c != "" && !isValidCompressionType(c) {
+			return errors.Errorf("unsupported compression type: %q", c)
+		}
+	case "storage.filesystem.path":
+		if v.(string) == "" {
+			return errors.New("storage.filesystem.path can't be empty")
+		}
+	case "storage.s3.debugLogLevels":
+		s3.SDKLogLevel(v.(string), os.Stderr)
 	}
 
 	_, err = p.Conn.Database(DB).Collection(ConfigCollection).UpdateOne(
 		p.ctx,
 		bson.D{},
 		bson.M{"$set": bson.M{key: v}},
+	)
+
+	return errors.Wrap(err, "write to db")
+}
+
+func (p *PBM) DeleteConfigVar(key string) error {
+	if !ValidateConfigKey(key) {
+		return errors.New("invalid config key")
+	}
+
+	_, err := p.GetConfig()
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return errors.New("config is not set")
+		}
+		return err
+	}
+
+	_, err = p.Conn.Database(DB).Collection(ConfigCollection).UpdateOne(
+		p.ctx,
+		bson.D{},
+		bson.M{"$unset": bson.M{key: 1}},
 	)
 
 	return errors.Wrap(err, "write to db")
@@ -190,6 +325,9 @@ func (p *PBM) GetConfigVar(key string) (interface{}, error) {
 		return nil, errors.Wrap(err, "get from db")
 	}
 	v, err := bts.LookupErr(strings.Split(key, ".")...)
+	if err != nil {
+		return nil, errors.Wrap(err, "lookup in document")
+	}
 	switch v.Type {
 	case bson.TypeBoolean:
 		return v.Boolean(), nil
@@ -200,7 +338,7 @@ func (p *PBM) GetConfigVar(key string) (interface{}, error) {
 	case bson.TypeDouble:
 		return v.Double(), nil
 	case bson.TypeString:
-		return v.String(), nil
+		return v.StringValue(), nil
 	default:
 		return nil, errors.Errorf("unexpected type %v", v.Type)
 	}
@@ -231,6 +369,9 @@ func (p *PBM) GetConfigYaml(fieldRedaction bool) ([]byte, error) {
 		if c.Storage.S3.Credentials.Vault.Token != "" {
 			c.Storage.S3.Credentials.Vault.Token = "***"
 		}
+		if c.Storage.Azure.Credentials.Key != "" {
+			c.Storage.Azure.Credentials.Key = "***"
+		}
 	}
 
 	b, err := yaml.Marshal(c)
@@ -244,7 +385,14 @@ func (p *PBM) GetConfig() (Config, error) {
 		return Config{}, errors.Wrap(res.Err(), "get")
 	}
 	err := res.Decode(&c)
-	return c, errors.Wrap(err, "decode")
+	if err != nil {
+		return c, errors.Wrap(err, "decode")
+	}
+	err = c.PITR.Cast()
+	if err != nil {
+		return c, errors.Wrap(err, "cast options")
+	}
+	return c, nil
 }
 
 // ErrStorageUndefined is an error for undefined storage
@@ -261,6 +409,8 @@ func (p *PBM) GetStorage(l *log.Event) (storage.Storage, error) {
 	switch c.Storage.Type {
 	case StorageS3:
 		return s3.New(c.Storage.S3, l)
+	case StorageAzure:
+		return azure.New(c.Storage.Azure, l)
 	case StorageFilesystem:
 		return fs.New(c.Storage.Filesystem), nil
 	case StorageBlackHole:

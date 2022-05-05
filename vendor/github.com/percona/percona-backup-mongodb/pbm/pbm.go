@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -43,35 +44,36 @@ const (
 	RestoresCollection = "pbmRestores"
 	// CmdStreamCollection is the name of the mongo collection that contains backup/restore commands stream
 	CmdStreamCollection = "pbmCmd"
-	// PITRCollection represents current incremental backups state
-	PITRCollection = "pbmPITRState"
-	//PITRChunksCollection contains index metadata of PITR chunks
+	// PITRChunksCollection contains index metadata of PITR chunks
 	PITRChunksCollection = "pbmPITRChunks"
-	//PITRChunksOldCollection contains archived index metadata of PITR chunks
+	// PITRChunksOldCollection contains archived index metadata of PITR chunks
 	PITRChunksOldCollection = "pbmPITRChunks.old"
-	// StatusCollection stores pbm status
-	StatusCollection = "pbmStatus"
-	// PBMOpLogCollection contains log of aquired locks (hence run ops)
+	// PBMOpLogCollection contains log of acquired locks (hence run ops)
 	PBMOpLogCollection = "pbmOpLog"
-	// AgentsStatusCollection is a agents registry with its status/health checks
+	// AgentsStatusCollection is an agents registry with its status/health checks
 	AgentsStatusCollection = "pbmAgents"
 
 	// MetadataFileSuffix is a suffix for the metadata file on a storage
 	MetadataFileSuffix = ".pbm.json"
 )
 
+// ErrNotFound - object not found
+var ErrNotFound = errors.New("not found")
+
 // Command represents actions that could be done on behalf of the client by the agents
 type Command string
 
 const (
-	CmdUndefined        Command = ""
-	CmdBackup           Command = "backup"
-	CmdRestore          Command = "restore"
-	CmdCancelBackup     Command = "cancelBackup"
-	CmdResyncBackupList Command = "resyncBcpList"
-	CmdPITR             Command = "pitr"
-	CmdPITRestore       Command = "pitrestore"
-	CmdDeleteBackup     Command = "delete"
+	CmdUndefined    Command = ""
+	CmdBackup       Command = "backup"
+	CmdRestore      Command = "restore"
+	CmdReplay       Command = "replay"
+	CmdCancelBackup Command = "cancelBackup"
+	CmdResync       Command = "resync"
+	CmdPITR         Command = "pitr"
+	CmdPITRestore   Command = "pitrestore"
+	CmdDeleteBackup Command = "delete"
+	CmdDeletePITR   Command = "deletePitr"
 )
 
 func (c Command) String() string {
@@ -80,9 +82,11 @@ func (c Command) String() string {
 		return "Snapshot backup"
 	case CmdRestore:
 		return "Snapshot restore"
+	case CmdReplay:
+		return "Oplog replay"
 	case CmdCancelBackup:
-		return "Backup cancelation"
-	case CmdResyncBackupList:
+		return "Backup cancellation"
+	case CmdResync:
 		return "Resync storage"
 	case CmdPITR:
 		return "PITR incremental backup"
@@ -90,6 +94,8 @@ func (c Command) String() string {
 		return "PITR restore"
 	case CmdDeleteBackup:
 		return "Delete"
+	case CmdDeletePITR:
+		return "Delete PITR chunks"
 	default:
 		return "Undefined"
 	}
@@ -101,8 +107,10 @@ type Cmd struct {
 	Cmd        Command         `bson:"cmd"`
 	Backup     BackupCmd       `bson:"backup,omitempty"`
 	Restore    RestoreCmd      `bson:"restore,omitempty"`
+	Replay     ReplayCmd       `bson:"replay,omitempty"`
 	PITRestore PITRestoreCmd   `bson:"pitrestore,omitempty"`
 	Delete     DeleteBackupCmd `bson:"delete,omitempty"`
+	DeletePITR DeletePITRCmd   `bson:"deletePitr,omitempty"`
 	TS         int64           `bson:"ts"`
 	OPID       OPID            `bson:"-"`
 }
@@ -150,12 +158,20 @@ func (c Cmd) String() string {
 }
 
 type BackupCmd struct {
-	Name        string          `bson:"name"`
-	Compression CompressionType `bson:"compression"`
+	Type             BackupType      `bson:"type"`
+	Name             string          `bson:"name"`
+	Compression      CompressionType `bson:"compression"`
+	CompressionLevel *int            `bson:"level,omitempty"`
 }
 
 func (b BackupCmd) String() string {
-	return fmt.Sprintf("name: %s, compression: %s", b.Name, b.Compression)
+	var level string
+	if b.CompressionLevel == nil {
+		level = "default"
+	} else {
+		level = strconv.Itoa(*b.CompressionLevel)
+	}
+	return fmt.Sprintf("name: %s, compression: %s (level: %s)", b.Name, b.Compression, level)
 }
 
 type RestoreCmd struct {
@@ -167,18 +183,37 @@ func (r RestoreCmd) String() string {
 	return fmt.Sprintf("name: %s, backup name: %s", r.Name, r.BackupName)
 }
 
+type ReplayCmd struct {
+	Name  string              `bson:"name"`
+	Start primitive.Timestamp `bson:"start,omitempty"`
+	End   primitive.Timestamp `bson:"end,omitempty"`
+}
+
+func (c ReplayCmd) String() string {
+	return fmt.Sprintf("name: %s, time: %d - %d", c.Name, c.Start, c.End)
+}
+
 type PITRestoreCmd struct {
 	Name string `bson:"name"`
 	TS   int64  `bson:"ts"`
+	I    int64  `bson:"i"`
+	Bcp  string `bson:"bcp"`
 }
 
 func (p PITRestoreCmd) String() string {
+	if p.Bcp != "" {
+		return fmt.Sprintf("name: %s, point-in-time ts: %d, base-snapshot: %s", p.Name, p.TS, p.Bcp)
+	}
 	return fmt.Sprintf("name: %s, point-in-time ts: %d", p.Name, p.TS)
 }
 
 type DeleteBackupCmd struct {
 	Backup    string `bson:"backup"`
 	OlderThan int64  `bson:"olderthan"`
+}
+
+type DeletePITRCmd struct {
+	OlderThan int64 `bson:"olderthan"`
 }
 
 func (d DeleteBackupCmd) String() string {
@@ -188,13 +223,65 @@ func (d DeleteBackupCmd) String() string {
 type CompressionType string
 
 const (
-	CompressionTypeNone   CompressionType = "none"
-	CompressionTypeGZIP   CompressionType = "gzip"
-	CompressionTypePGZIP  CompressionType = "pgzip"
-	CompressionTypeSNAPPY CompressionType = "snappy"
-	CompressionTypeLZ4    CompressionType = "lz4"
-	CompressionTypeS2     CompressionType = "s2"
+	CompressionTypeNone      CompressionType = "none"
+	CompressionTypeGZIP      CompressionType = "gzip"
+	CompressionTypePGZIP     CompressionType = "pgzip"
+	CompressionTypeSNAPPY    CompressionType = "snappy"
+	CompressionTypeLZ4       CompressionType = "lz4"
+	CompressionTypeS2        CompressionType = "s2"
+	CompressionTypeZstandard CompressionType = "zstd"
 )
+
+func isValidCompressionType(s string) bool {
+	switch CompressionType(s) {
+	case
+		CompressionTypeNone,
+		CompressionTypeGZIP,
+		CompressionTypePGZIP,
+		CompressionTypeSNAPPY,
+		CompressionTypeLZ4,
+		CompressionTypeS2,
+		CompressionTypeZstandard:
+		return true
+	}
+
+	return false
+}
+
+func (c CompressionType) Suffix() string {
+	switch c {
+	case CompressionTypeGZIP, CompressionTypePGZIP:
+		return ".gz"
+	case CompressionTypeLZ4:
+		return ".lz4"
+	case CompressionTypeSNAPPY:
+		return ".snappy"
+	case CompressionTypeS2:
+		return ".s2"
+	case CompressionTypeZstandard:
+		return ".zst"
+	default:
+		return ""
+	}
+}
+
+// FileCompression return compression alg based on given file extension
+func FileCompression(ext string) CompressionType {
+	switch ext {
+	default:
+		return CompressionTypeNone
+	case "gz":
+		return CompressionTypePGZIP
+	case "lz4":
+		return CompressionTypeLZ4
+	case "snappy":
+		return CompressionTypeSNAPPY
+	case "s2":
+		return CompressionTypeS2
+	case "zst":
+		return CompressionTypeZstandard
+	}
+}
 
 const (
 	PITRcheckRange       = time.Second * 15
@@ -240,7 +327,7 @@ func New(ctx context.Context, uri, appName string) (*PBM, error) {
 		return nil, errors.Wrap(err, "get topology")
 	}
 
-	if !inf.IsSharded() || inf.ReplsetRole() == ReplRoleConfigSrv {
+	if !inf.IsSharded() || inf.ReplsetRole() == RoleConfigSrv {
 		return pbm, errors.Wrap(pbm.setupNewDB(), "setup a new backups db")
 	}
 
@@ -291,7 +378,7 @@ func (p *PBM) Logger() *log.Logger {
 
 const (
 	cmdCollectionSizeBytes      = 1 << 20  // 1Mb
-	pbmOplogCollectionSizeBytes = 10 << 20 // 1Mb
+	pbmOplogCollectionSizeBytes = 10 << 20 // 10Mb
 	logsCollectionSizeBytes     = 50 << 20 // 50Mb
 )
 
@@ -367,7 +454,7 @@ func (p *PBM) setupNewDB() error {
 		return errors.Wrapf(err, "ensure lock index on %s", LockOpCollection)
 	}
 
-	// create indexs for the pitr cunks
+	// create indexs for the pitr chunks
 	_, err = p.Conn.Database(DB).Collection(PITRChunksCollection).Indexes().CreateMany(
 		p.ctx,
 		[]mongo.IndexModel{
@@ -428,22 +515,41 @@ func connect(ctx context.Context, uri, appName string) (*mongo.Client, error) {
 	return client, nil
 }
 
+type BackupType string
+
+const (
+	PhysicalBackup BackupType = "physical"
+	LogicalBackup  BackupType = "logical"
+)
+
 // BackupMeta is a backup's metadata
 type BackupMeta struct {
-	OPID             string              `bson:"opid" json:"opid"`
-	Name             string              `bson:"name" json:"name"`
-	Replsets         []BackupReplset     `bson:"replsets" json:"replsets"`
-	Compression      CompressionType     `bson:"compression" json:"compression"`
-	Store            StorageConf         `bson:"store" json:"store"`
-	MongoVersion     string              `bson:"mongodb_version" json:"mongodb_version,omitempty"`
-	StartTS          int64               `bson:"start_ts" json:"start_ts"`
-	LastTransitionTS int64               `bson:"last_transition_ts" json:"last_transition_ts"`
-	LastWriteTS      primitive.Timestamp `bson:"last_write_ts" json:"last_write_ts"`
-	Hb               primitive.Timestamp `bson:"hb" json:"hb"`
-	Status           Status              `bson:"status" json:"status"`
-	Conditions       []Condition         `bson:"conditions" json:"conditions"`
-	Error            string              `bson:"error,omitempty" json:"error,omitempty"`
-	PBMVersion       string              `bson:"pbm_version,omitempty" json:"pbm_version,omitempty"`
+	Type             BackupType           `bson:"type" json:"type"`
+	OPID             string               `bson:"opid" json:"opid"`
+	Name             string               `bson:"name" json:"name"`
+	Replsets         []BackupReplset      `bson:"replsets" json:"replsets"`
+	Compression      CompressionType      `bson:"compression" json:"compression"`
+	Store            StorageConf          `bson:"store" json:"store"`
+	MongoVersion     string               `bson:"mongodb_version" json:"mongodb_version,omitempty"`
+	StartTS          int64                `bson:"start_ts" json:"start_ts"`
+	LastTransitionTS int64                `bson:"last_transition_ts" json:"last_transition_ts"`
+	FirstWriteTS     primitive.Timestamp  `bson:"first_write_ts" json:"first_write_ts"`
+	LastWriteTS      primitive.Timestamp  `bson:"last_write_ts" json:"last_write_ts"`
+	Hb               primitive.Timestamp  `bson:"hb" json:"hb"`
+	Status           Status               `bson:"status" json:"status"`
+	Conditions       []Condition          `bson:"conditions" json:"conditions"`
+	Nomination       []BackupRsNomination `bson:"n" json:"n"`
+	Error            string               `bson:"error,omitempty" json:"error,omitempty"`
+	PBMVersion       string               `bson:"pbm_version,omitempty" json:"pbm_version,omitempty"`
+	BalancerStatus   BalancerMode         `bson:"balancer" json:"balancer"`
+}
+
+// BackupRsNomination is used to choose (nominate and elect) nodes for the backup
+// within a replica set
+type BackupRsNomination struct {
+	RS    string   `bson:"rs" json:"rs"`
+	Nodes []string `bson:"n" json:"n"`
+	Ack   string   `bson:"ack" json:"ack"`
 }
 
 type Condition struct {
@@ -454,8 +560,9 @@ type Condition struct {
 
 type BackupReplset struct {
 	Name             string              `bson:"name" json:"name"`
-	DumpName         string              `bson:"dump_name" json:"backup_name" `
-	OplogName        string              `bson:"oplog_name" json:"oplog_name"`
+	Files            []File              `bson:"files,omitempty" json:"files,omitempty" `
+	DumpName         string              `bson:"dump_name,omitempty" json:"backup_name,omitempty" `
+	OplogName        string              `bson:"oplog_name,omitempty" json:"oplog_name,omitempty"`
 	StartTS          int64               `bson:"start_ts" json:"start_ts"`
 	Status           Status              `bson:"status" json:"status"`
 	LastTransitionTS int64               `bson:"last_transition_ts" json:"last_transition_ts"`
@@ -465,10 +572,20 @@ type BackupReplset struct {
 	Conditions       []Condition         `bson:"conditions" json:"conditions"`
 }
 
+type File struct {
+	Name    string      `bson:"filename" json:"filename"`
+	Size    int64       `bson:"fileSize" json:"fileSize"`
+	StgSize int64       `bson:"stgSize" json:"stgSize"`
+	Fmode   os.FileMode `bson:"fmode" json:"fmode"`
+}
+
 // Status is a backup current status
 type Status string
 
 const (
+	StatusInit  Status = "init"
+	StatusReady Status = "ready"
+
 	StatusStarting  Status = "starting"
 	StatusRunning   Status = "running"
 	StatusDumpDone  Status = "dumpDone"
@@ -503,9 +620,11 @@ func (b *BackupMeta) RS(name string) *BackupReplset {
 func (p *PBM) ChangeBackupStateOPID(opid string, s Status, msg string) error {
 	return p.changeBackupState(bson.D{{"opid", opid}}, s, msg)
 }
+
 func (p *PBM) ChangeBackupState(bcpName string, s Status, msg string) error {
 	return p.changeBackupState(bson.D{{"name", bcpName}}, s, msg)
 }
+
 func (p *PBM) changeBackupState(clause bson.D, s Status, msg string) error {
 	ts := time.Now().UTC().Unix()
 	_, err := p.Conn.Database(DB).Collection(BcpCollection).UpdateOne(
@@ -539,12 +658,24 @@ func (p *PBM) BackupHB(bcpName string) error {
 	return errors.Wrap(err, "write into db")
 }
 
-func (p *PBM) SetLastWrite(bcpName string, ts primitive.Timestamp) error {
+func (p *PBM) SetFirstWrite(bcpName string, first primitive.Timestamp) error {
 	_, err := p.Conn.Database(DB).Collection(BcpCollection).UpdateOne(
 		p.ctx,
 		bson.D{{"name", bcpName}},
 		bson.D{
-			{"$set", bson.M{"last_write_ts": ts}},
+			{"$set", bson.M{"first_write_ts": first}},
+		},
+	)
+
+	return err
+}
+
+func (p *PBM) SetLastWrite(bcpName string, last primitive.Timestamp) error {
+	_, err := p.Conn.Database(DB).Collection(BcpCollection).UpdateOne(
+		p.ctx,
+		bson.D{{"name", bcpName}},
+		bson.D{
+			{"$set", bson.M{"last_write_ts": last}},
 		},
 	)
 
@@ -582,12 +713,12 @@ func (p *PBM) ChangeRSState(bcpName string, rsName string, s Status, msg string)
 	return err
 }
 
-func (p *PBM) SetRSFirstWrite(bcpName string, rsName string, ts primitive.Timestamp) error {
+func (p *PBM) RSSetPhyFiles(bcpName string, rsName string, f []File) error {
 	_, err := p.Conn.Database(DB).Collection(BcpCollection).UpdateOne(
 		p.ctx,
 		bson.D{{"name", bcpName}, {"replsets.name", rsName}},
 		bson.D{
-			{"$set", bson.M{"replsets.$.first_write_ts": ts}},
+			{"$set", bson.M{"replsets.$.files": f}},
 		},
 	)
 
@@ -615,32 +746,31 @@ func (p *PBM) GetBackupByOPID(opid string) (*BackupMeta, error) {
 }
 
 func (p *PBM) getBackupMeta(clause bson.D) (*BackupMeta, error) {
-	b := new(BackupMeta)
 	res := p.Conn.Database(DB).Collection(BcpCollection).FindOne(p.ctx, clause)
 	if res.Err() != nil {
 		if res.Err() == mongo.ErrNoDocuments {
-			return b, nil
+			return nil, ErrNotFound
 		}
 		return nil, errors.Wrap(res.Err(), "get")
 	}
+
+	b := &BackupMeta{}
 	err := res.Decode(b)
 	return b, errors.Wrap(err, "decode")
 }
 
-// GetFirstBackup returns first successfully finished backup
-func (p *PBM) GetFirstBackup() (*BackupMeta, error) {
-	return p.getRecentBackup(nil, 1)
-}
-
 // GetLastBackup returns last successfully finished backup
-// and nil if there is no such backup yet. If ts isn't nil it will
+// or nil if there is no such backup yet. If ts isn't nil it will
 // search for the most recent backup that finished before specified timestamp
 func (p *PBM) GetLastBackup(before *primitive.Timestamp) (*BackupMeta, error) {
 	return p.getRecentBackup(before, -1)
 }
 
 func (p *PBM) getRecentBackup(before *primitive.Timestamp, sort int) (*BackupMeta, error) {
-	q := bson.D{{"status", StatusDone}}
+	q := bson.D{
+		{"status", StatusDone},
+		{"type", bson.M{"$ne": string(PhysicalBackup)}},
+	}
 	if before != nil {
 		q = append(q, bson.E{"last_write_ts", bson.M{"$lte": before}})
 	}
@@ -652,7 +782,7 @@ func (p *PBM) getRecentBackup(before *primitive.Timestamp, sort int) (*BackupMet
 	)
 	if res.Err() != nil {
 		if res.Err() == mongo.ErrNoDocuments {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		return nil, errors.Wrap(res.Err(), "get")
 	}
@@ -702,23 +832,53 @@ func (p *PBM) BackupsList(limit int64) ([]BackupMeta, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "message decode")
 		}
+		if b.Type == "" {
+			b.Type = LogicalBackup
+		}
 		backups = append(backups, b)
 	}
 
 	return backups, cur.Err()
 }
 
-// ClusterMembers returns list of replicasets current cluster consts of
-// (shards + configserver). The list would consist of on rs if cluster is
-// a non-sharded rs. If `inf` is nil, method would request mongo to define it.
-func (p *PBM) ClusterMembers(inf *NodeInfo) ([]Shard, error) {
-	var err error
+func (p *PBM) BackupsDoneList(after *primitive.Timestamp, limit int64, order int) ([]BackupMeta, error) {
+	q := bson.D{{"status", StatusDone}}
+	if after != nil {
+		q = append(q, bson.E{"last_write_ts", bson.M{"$gte": after}})
+	}
 
-	if inf == nil {
-		inf, err = p.GetNodeInfo()
+	cur, err := p.Conn.Database(DB).Collection(BcpCollection).Find(
+		p.ctx,
+		q,
+		options.Find().SetLimit(limit).SetSort(bson.D{{"last_write_ts", order}}),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "query mongo")
+	}
+
+	defer cur.Close(p.ctx)
+
+	backups := []BackupMeta{}
+	for cur.Next(p.ctx) {
+		b := BackupMeta{}
+		err := cur.Decode(&b)
 		if err != nil {
-			return nil, errors.Wrap(err, "define cluster state")
+			return nil, errors.Wrap(err, "message decode")
 		}
+		backups = append(backups, b)
+	}
+
+	return backups, cur.Err()
+}
+
+// ClusterMembers returns list of replicasets current cluster consists of
+// (shards + configserver). The list would consist of on rs if cluster is
+// a non-sharded rs.
+func (p *PBM) ClusterMembers() ([]Shard, error) {
+	// it would be a config server in sharded cluster
+	inf, err := p.GetNodeInfo()
+	if err != nil {
+		return nil, errors.Wrap(err, "define cluster state")
 	}
 
 	shards := []Shard{{
@@ -801,12 +961,42 @@ func (p *PBM) ClusterTime() (primitive.Timestamp, error) {
 	return inf.ClusterTime.ClusterTime, nil
 }
 
-func (p *PBM) LogGet(r *log.LogRequest, limit int64) ([]log.LogEntry, error) {
-	return p.log.Get(r, limit, false)
+func (p *PBM) LogGet(r *log.LogRequest, limit int64) (*log.Entries, error) {
+	return log.Get(p.Conn.Database(DB).Collection(LogCollection), r, limit, false)
 }
 
-func (p *PBM) LogGetExactSeverity(r *log.LogRequest, limit int64) ([]log.LogEntry, error) {
-	return p.log.Get(r, limit, true)
+func (p *PBM) LogGetExactSeverity(r *log.LogRequest, limit int64) (*log.Entries, error) {
+	return log.Get(p.Conn.Database(DB).Collection(LogCollection), r, limit, true)
+}
+
+// SetBalancerStatus sets balancer status
+func (p *PBM) SetBalancerStatus(m BalancerMode) error {
+	var cmd string
+
+	switch m {
+	case BalancerModeOn:
+		cmd = "_configsvrBalancerStart"
+	case BalancerModeOff:
+		cmd = "_configsvrBalancerStop"
+	default:
+		return errors.Errorf("unknown mode %s", m)
+	}
+
+	err := p.Conn.Database("admin").RunCommand(p.ctx, bson.D{{cmd, 1}}).Err()
+	if err != nil {
+		return errors.Wrap(err, "run mongo command")
+	}
+	return nil
+}
+
+// GetBalancerStatus returns balancer status
+func (p *PBM) GetBalancerStatus() (*BalancerStatus, error) {
+	inf := &BalancerStatus{}
+	err := p.Conn.Database("admin").RunCommand(p.ctx, bson.D{{"_configsvrBalancerStatus", 1}}).Decode(inf)
+	if err != nil {
+		return nil, errors.Wrap(err, "run mongo command")
+	}
+	return inf, nil
 }
 
 type Epoch primitive.Timestamp
@@ -838,112 +1028,21 @@ func (e Epoch) TS() primitive.Timestamp {
 	return primitive.Timestamp(e)
 }
 
-// FileCompression return compression alg based on given file extention
-func FileCompression(ext string) CompressionType {
-	switch ext {
-	default:
-		return CompressionTypeNone
-	case "gz":
-		return CompressionTypePGZIP
-	case "lz4":
-		return CompressionTypeLZ4
-	case "snappy":
-		return CompressionTypeS2
-	}
-}
-
-type AgentStat struct {
-	Node          string              `bson:"n"`
-	RS            string              `bson:"rs"`
-	Ver           string              `bson:"v"`
-	PBMStatus     SubsysStatus        `bson:"pbms"`
-	NodeStatus    SubsysStatus        `bson:"nodes"`
-	StorageStatus SubsysStatus        `bson:"stors"`
-	Heartbeat     primitive.Timestamp `bson:"hb"`
-}
-
-type SubsysStatus struct {
-	OK  bool   `bson:"ok"`
-	Err string `bson:"e"`
-}
-
-func (s *AgentStat) OK() (ok bool, errs []string) {
-	ok = true
-	if !s.PBMStatus.OK {
-		ok = false
-		errs = append(errs, fmt.Sprintf("PBM connection: %s", s.PBMStatus.Err))
-	}
-	if !s.NodeStatus.OK {
-		ok = false
-		errs = append(errs, fmt.Sprintf("node connection: %s", s.NodeStatus.Err))
-	}
-	if !s.StorageStatus.OK {
-		ok = false
-		errs = append(errs, fmt.Sprintf("storage: %s", s.StorageStatus.Err))
-	}
-
-	return ok, errs
-}
-
-func (p *PBM) SetAgentStatus(stat AgentStat) error {
-	ct, err := p.ClusterTime()
+// CopyColl copy documents matching the given filter and return number of copied documents
+func CopyColl(ctx context.Context, from, to *mongo.Collection, filter interface{}) (n int, err error) {
+	cur, err := from.Find(ctx, filter)
 	if err != nil {
-		return errors.Wrap(err, "get cluster time")
+		return 0, errors.Wrap(err, "create cursor")
 	}
-	stat.Heartbeat = ct
+	defer cur.Close(ctx)
 
-	_, err = p.Conn.Database(DB).Collection(AgentsStatusCollection).ReplaceOne(
-		p.ctx,
-		bson.D{{"n", stat.Node}, {"rs", stat.RS}},
-		stat,
-		options.Replace().SetUpsert(true),
-	)
-	return errors.Wrap(err, "write into db")
-}
-
-func (p *PBM) RmAgentStatus(stat AgentStat) error {
-	_, err := p.Conn.Database(DB).Collection(AgentsStatusCollection).DeleteOne(
-		p.ctx,
-		bson.D{{"n", stat.Node}, {"rs", stat.RS}},
-	)
-
-	return err
-}
-
-// GetAgentStatus returns agent status by given node and rs
-// it's up to user how to handle ErrNoDocuments
-func (p *PBM) GetAgentStatus(rs, node string) (s AgentStat, err error) {
-	res := p.Conn.Database(DB).Collection(AgentsStatusCollection).FindOne(
-		p.ctx,
-		bson.D{{"n", node}, {"rs", rs}},
-	)
-	if res.Err() != nil {
-		return s, errors.Wrap(res.Err(), "query mongo")
+	for cur.Next(ctx) {
+		_, err = to.InsertOne(ctx, cur.Current)
+		if err != nil {
+			return 0, errors.Wrap(err, "insert document")
+		}
+		n++
 	}
 
-	err = res.Decode(&s)
-	return s, errors.Wrap(err, "decode")
-}
-
-// AgentStatusGC cleans up stale agent statuses
-func (p *PBM) AgentStatusGC() error {
-	ct, err := p.ClusterTime()
-	if err != nil {
-		return errors.Wrap(err, "get cluster time")
-	}
-	// 30 secs is the connection time out for mongo. So if there are some connection issues the agent checker
-	// may stuck for 30 sec on ping (trying to connect), it's HB became stale and it would be collected.
-	// Which would lead to the false clamin "not found" in the status output. So stale range should at least 30 sec
-	// (+5 just in case).
-	stalesec := AgentsStatCheckRange.Seconds() * 3
-	if stalesec < 35 {
-		stalesec = 35
-	}
-	ct.T -= uint32(stalesec)
-	_, err = p.Conn.Database(DB).Collection(AgentsStatusCollection).DeleteMany(
-		p.ctx,
-		bson.M{"hb": bson.M{"$lt": ct}},
-	)
-
-	return errors.Wrap(err, "delete")
+	return n, nil
 }

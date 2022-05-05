@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -25,6 +26,7 @@ import (
 
 	psmdbv1 "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/backup"
+	"github.com/percona/percona-server-mongodb-operator/version"
 )
 
 var log = logf.Log.WithName("controller_perconaservermongodbrestore")
@@ -81,14 +83,14 @@ type ReconcilePerconaServerMongoDBRestore struct {
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
-func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	rr := reconcile.Result{
 		RequeueAfter: time.Second * 5,
 	}
 
 	// Fetch the PerconaSMDBBackupRestore instance
 	cr := &psmdbv1.PerconaServerMongoDBRestore{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, cr)
+	err := r.client.Get(ctx, request.NamespacedName, cr)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -110,7 +112,7 @@ func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Reque
 		}
 		if cr.Status.State != status.State || cr.Status.Error != status.Error {
 			cr.Status = status
-			uerr := r.updateStatus(cr)
+			uerr := r.updateStatus(ctx, cr)
 			if uerr != nil {
 				log.Error(uerr, "failed to updated restore status", "restore", cr.Name, "backup", cr.Spec.BackupName)
 			}
@@ -127,7 +129,7 @@ func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Reque
 		return rr, nil
 	}
 
-	status, err = r.reconcileRestore(cr)
+	status, err = r.reconcileRestore(ctx, cr)
 	if err != nil {
 		return rr, fmt.Errorf("reconcile: %v", err)
 	}
@@ -135,16 +137,29 @@ func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Reque
 	return rr, nil
 }
 
-func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.PerconaServerMongoDBRestore) (psmdbv1.PerconaServerMongoDBRestoreStatus, error) {
+func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(ctx context.Context, cr *psmdbv1.PerconaServerMongoDBRestore) (psmdbv1.PerconaServerMongoDBRestoreStatus, error) {
 	status := cr.Status
 
 	cluster := &psmdbv1.PerconaServerMongoDB{}
-	err := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.ClusterName, Namespace: cr.Namespace}, cluster)
+	err := r.client.Get(ctx, types.NamespacedName{Name: cr.Spec.ClusterName, Namespace: cr.Namespace}, cluster)
 	if err != nil {
 		return status, errors.Wrapf(err, "get cluster %s/%s", cr.Namespace, cr.Spec.ClusterName)
 	}
 
-	cjobs, err := backup.HasActiveJobs(r.client, cluster, backup.NewRestoreJob(cr), backup.NotPITRLock)
+	if cluster.Spec.Unmanaged {
+		return status, errors.New("cluster is unmanaged")
+	}
+
+	svr, err := version.Server()
+	if err != nil {
+		return status, errors.Wrapf(err, "fetch server version")
+	}
+
+	if err := cluster.CheckNSetDefaults(svr.Platform, log); err != nil {
+		return status, errors.Wrapf(err, "set defaults for %s/%s", cluster.Namespace, cluster.Name)
+	}
+
+	cjobs, err := backup.HasActiveJobs(ctx, r.client, cluster, backup.NewRestoreJob(cr), backup.NotPITRLock)
 	if err != nil {
 		return status, errors.Wrap(err, "check for concurrent jobs")
 	}
@@ -162,7 +177,7 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 	)
 
 	if backupName == "" || storageName == "" {
-		bcp, err := r.getBackup(cr)
+		bcp, err := r.getBackup(ctx, cr)
 		if err != nil {
 			return status, errors.Wrap(err, "get backup")
 		}
@@ -176,7 +191,7 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 
 	if cluster.Spec.Sharding.Enabled {
 		mongos := appsv1.Deployment{}
-		err = r.client.Get(context.Background(), cluster.MongosNamespacedName(), &mongos)
+		err = r.client.Get(ctx, cluster.MongosNamespacedName(), &mongos)
 		if err != nil && !k8serrors.IsNotFound(err) {
 			return status, errors.Wrapf(err, "failed to get mongos")
 		}
@@ -189,13 +204,13 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 		}
 	}
 
-	pbmc, errPBM := backup.NewPBM(r.client, cluster)
+	pbmc, errPBM := backup.NewPBM(ctx, r.client, cluster)
 	if errPBM != nil {
 		log.Info("Waiting for pbm-agent.")
 		status.State = psmdbv1.RestoreStateWaiting
 		return status, nil
 	}
-	defer pbmc.Close()
+	defer pbmc.Close(ctx)
 
 	if status.State == psmdbv1.RestoreStateNew || status.State == psmdbv1.RestoreStateWaiting {
 		storage, err := r.getStorage(cr, cluster, storageName)
@@ -203,7 +218,12 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 			return status, errors.Wrap(err, "get storage")
 		}
 
-		err = pbmc.SetConfig(storage, cluster.Spec.Backup.PITR.Disabled())
+		priorities, err := pbmc.GetPriorities(ctx, r.client, cluster)
+		if err != nil {
+			return status, errors.Wrap(err, "get pbm priorities")
+		}
+
+		err = pbmc.SetConfig(ctx, storage, cluster.Spec.Backup.PITR.Disabled(), priorities)
 		if err != nil {
 			return status, errors.Wrap(err, "set pbm config")
 		}
@@ -219,13 +239,13 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 			return status, nil
 		}
 
-		status.PBMname, err = runRestore(backupName, pbmc, cr.Spec.PITR)
+		status.PBMname, err = runRestore(ctx, backupName, pbmc, cr.Spec.PITR)
 		status.State = psmdbv1.RestoreStateRequested
 		return status, err
 	}
 
 	meta, err := pbmc.C.GetRestoreMeta(cr.Status.PBMname)
-	if err != nil {
+	if err != nil && !errors.Is(err, pbm.ErrNotFound) {
 		return status, errors.Wrap(err, "get pbm metadata")
 	}
 
@@ -269,8 +289,8 @@ func reEnablePITR(pbm *backup.PBM, backup psmdbv1.BackupSpec) (err error) {
 	return
 }
 
-func runRestore(backup string, pbmc *backup.PBM, pitr *psmdbv1.PITRestoreSpec) (string, error) {
-	e := pbmc.C.Logger().NewEvent(string(pbm.CmdResyncBackupList), "", "", primitive.Timestamp{})
+func runRestore(ctx context.Context, backup string, pbmc *backup.PBM, pitr *psmdbv1.PITRestoreSpec) (string, error) {
+	e := pbmc.C.Logger().NewEvent(string(pbm.CmdResync), "", "", primitive.Timestamp{})
 	err := pbmc.C.ResyncStorage(e)
 	if err != nil {
 		return "", errors.Wrap(err, "set resync backup list from the store")
@@ -291,9 +311,9 @@ func runRestore(backup string, pbmc *backup.PBM, pitr *psmdbv1.PITRestoreSpec) (
 			},
 		}
 	case pitr.Type == psmdbv1.PITRestoreTypeDate:
-		var ts = pitr.Date.Unix()
+		ts := pitr.Date.Unix()
 
-		if _, err := pbmc.GetPITRChunkContains(ts); err != nil {
+		if _, err := pbmc.GetPITRChunkContains(ctx, ts); err != nil {
 			return "", err
 		}
 
@@ -334,14 +354,24 @@ func (r *ReconcilePerconaServerMongoDBRestore) getStorage(cr *psmdbv1.PerconaSer
 		}
 		return storage, nil
 	}
+	var azure psmdbv1.BackupStorageAzureSpec
+	var s3 psmdbv1.BackupStorageS3Spec
+	storageType := psmdbv1.BackupStorageS3
 
+	if cr.Spec.BackupSource.Azure != nil {
+		storageType = psmdbv1.BackupStorageAzure
+		azure = *cr.Spec.BackupSource.Azure
+	} else if cr.Spec.BackupSource.S3 != nil {
+		s3 = *cr.Spec.BackupSource.S3
+	}
 	return psmdbv1.BackupStorageSpec{
-		Type: psmdbv1.BackupStorageS3,
-		S3:   *cr.Spec.BackupSource.S3,
+		Type:  storageType,
+		S3:    s3,
+		Azure: azure,
 	}, nil
 }
 
-func (r *ReconcilePerconaServerMongoDBRestore) getBackup(cr *psmdbv1.PerconaServerMongoDBRestore) (*psmdbv1.PerconaServerMongoDBBackup, error) {
+func (r *ReconcilePerconaServerMongoDBRestore) getBackup(ctx context.Context, cr *psmdbv1.PerconaServerMongoDBRestore) (*psmdbv1.PerconaServerMongoDBBackup, error) {
 	if len(cr.Spec.BackupName) == 0 && cr.Spec.BackupSource != nil {
 		s := strings.Split(cr.Spec.BackupSource.Destination, "/")
 		backupName := s[len(s)-1]
@@ -353,21 +383,22 @@ func (r *ReconcilePerconaServerMongoDBRestore) getBackup(cr *psmdbv1.PerconaServ
 				ClusterName: cr.ClusterName,
 			},
 			Spec: psmdbv1.PerconaServerMongoDBBackupSpec{
-				PSMDBCluster: cr.Spec.ClusterName,
-				StorageName:  cr.Spec.StorageName,
+				ClusterName: cr.Spec.ClusterName,
+				StorageName: cr.Spec.StorageName,
 			},
 			Status: psmdbv1.PerconaServerMongoDBBackupStatus{
 				State:       psmdbv1.BackupStateReady,
 				Destination: cr.Spec.BackupSource.Destination,
 				StorageName: cr.Spec.StorageName,
 				S3:          cr.Spec.BackupSource.S3,
+				Azure:       cr.Spec.BackupSource.Azure,
 				PBMname:     backupName,
 			},
 		}, nil
 	}
 
 	backup := &psmdbv1.PerconaServerMongoDBBackup{}
-	err := r.client.Get(context.TODO(), types.NamespacedName{
+	err := r.client.Get(ctx, types.NamespacedName{
 		Name:      cr.Spec.BackupName,
 		Namespace: cr.Namespace,
 	}, backup)
@@ -375,16 +406,19 @@ func (r *ReconcilePerconaServerMongoDBRestore) getBackup(cr *psmdbv1.PerconaServ
 	return backup, err
 }
 
-func (r *ReconcilePerconaServerMongoDBRestore) updateStatus(cr *psmdbv1.PerconaServerMongoDBRestore) error {
-	err := r.client.Status().Update(context.TODO(), cr)
-	if err != nil {
-		// maybe it's k8s v1.10 and earlier (e.g. oc3.9) that doesn't support status updates
-		// so try to update whole CR
-		//TODO: Update will not return error if user have no rights to update Status. Do we need to do something?
-		err := r.client.Update(context.TODO(), cr)
+func (r *ReconcilePerconaServerMongoDBRestore) updateStatus(ctx context.Context, cr *psmdbv1.PerconaServerMongoDBRestore) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		c := &psmdbv1.PerconaServerMongoDBRestore{}
+
+		err := r.client.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, c)
 		if err != nil {
-			return fmt.Errorf("send update: %v", err)
+			return err
 		}
-	}
-	return nil
+
+		c.Status = cr.Status
+
+		return r.client.Status().Update(ctx, c)
+	})
+
+	return errors.Wrap(err, "write status")
 }

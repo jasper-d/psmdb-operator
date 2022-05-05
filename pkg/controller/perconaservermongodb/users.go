@@ -9,18 +9,20 @@ import (
 
 	"github.com/pkg/errors"
 	mongod "go.mongodb.org/mongo-driver/mongo"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
 )
 
-func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) error {
+func (r *ReconcilePerconaServerMongoDB) reconcileUsers(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) error {
 	sysUsersSecretObj := corev1.Secret{}
-	err := r.client.Get(context.TODO(),
+	err := r.client.Get(ctx,
 		types.NamespacedName{
 			Namespace: cr.Namespace,
 			Name:      cr.Spec.Secrets.Users,
@@ -36,7 +38,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMong
 	secretName := api.InternalUserSecretName(cr)
 	internalSysSecretObj := corev1.Secret{}
 
-	err = r.client.Get(context.TODO(),
+	err = r.client.Get(ctx,
 		types.NamespacedName{
 			Namespace: cr.Namespace,
 			Name:      secretName,
@@ -53,7 +55,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMong
 			Name:      secretName,
 			Namespace: cr.Namespace,
 		}
-		err = r.client.Create(context.TODO(), internalSysUsersSecret)
+		err = r.client.Create(ctx, internalSysUsersSecret)
 		if err != nil {
 			return errors.Wrap(err, "create internal sys users secret")
 		}
@@ -76,17 +78,17 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMong
 		return errors.Wrap(err, "check sys users data changes")
 	}
 
-	if !dataChanged {
+	if !dataChanged || cr.Spec.Unmanaged {
 		return nil
 	}
 
-	containers, err := r.updateSysUsers(cr, &sysUsersSecretObj, &internalSysSecretObj, repls)
+	containers, err := r.updateSysUsers(ctx, cr, &sysUsersSecretObj, &internalSysSecretObj, repls)
 	if err != nil {
 		return errors.Wrap(err, "manage sys users")
 	}
 
 	if len(containers) > 0 {
-		rsPodList, err := r.getMongodPods(cr)
+		rsPodList, err := r.getMongodPods(ctx, cr)
 		if err != nil {
 			return errors.Wrap(err, "failed to get mongos pods")
 		}
@@ -94,14 +96,14 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMong
 		pods := rsPodList.Items
 
 		if cr.Spec.Sharding.Enabled {
-			mongosList, err := r.getMongosPods(cr)
+			mongosList, err := r.getMongosPods(ctx, cr)
 			if err != nil {
 				return errors.Wrap(err, "failed to get mongos pods")
 			}
 
 			pods = append(pods, mongosList.Items...)
 
-			cfgPodlist, err := r.getRSPods(cr, api.ConfigReplSetName)
+			cfgPodlist, err := psmdb.GetRSPods(ctx, r.client, cr, api.ConfigReplSetName)
 			if err != nil {
 				return errors.Wrap(err, "failed to get mongos pods")
 			}
@@ -118,7 +120,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileUsers(cr *api.PerconaServerMong
 	}
 
 	internalSysSecretObj.Data = sysUsersSecretObj.Data
-	err = r.client.Update(context.TODO(), &internalSysSecretObj)
+	err = r.client.Update(ctx, &internalSysSecretObj)
 	if err != nil {
 		return errors.Wrap(err, "update internal sys users secret")
 	}
@@ -191,7 +193,7 @@ func (su *systemUsers) len() int {
 	return len(su.users)
 }
 
-func (r *ReconcilePerconaServerMongoDB) updateSysUsers(cr *api.PerconaServerMongoDB, newUsersSec, currUsersSec *corev1.Secret,
+func (r *ReconcilePerconaServerMongoDB) updateSysUsers(ctx context.Context, cr *api.PerconaServerMongoDB, newUsersSec, currUsersSec *corev1.Secret,
 	repls []*api.ReplsetSpec) ([]string, error) {
 	su := systemUsers{
 		currData: currUsersSec.Data,
@@ -255,43 +257,47 @@ func (r *ReconcilePerconaServerMongoDB) updateSysUsers(cr *api.PerconaServerMong
 		return containers, nil
 	}
 
-	err := r.updateUsers(cr, su.users, repls)
+	err := r.updateUsers(ctx, cr, su.users, repls)
 
 	return containers, errors.Wrap(err, "mongo: update system users")
 }
 
-func (r *ReconcilePerconaServerMongoDB) updateUsers(cr *api.PerconaServerMongoDB, users []systemUser, repls []*api.ReplsetSpec) error {
-	for _, replset := range repls {
-		client, err := r.mongoClientWithRole(cr, *replset, roleUserAdmin)
-		if err != nil {
-			return errors.Wrap(err, "dial:")
-		}
+func (r *ReconcilePerconaServerMongoDB) updateUsers(ctx context.Context, cr *api.PerconaServerMongoDB, users []systemUser, repls []*api.ReplsetSpec) error {
+	grp, gCtx := errgroup.WithContext(ctx)
 
-		defer func() {
-			err := client.Disconnect(context.TODO())
+	for i := range repls {
+		replset := repls[i]
+		grp.Go(func() error {
+			client, err := r.mongoClientWithRole(gCtx, cr, *replset, roleUserAdmin)
 			if err != nil {
-				log.Error(err, "failed to close connection")
+				return errors.Wrap(err, "dial:")
 			}
-		}()
 
-		for _, user := range users {
-			err := user.updateMongo(client)
-			if err != nil {
-				return errors.Wrapf(err, "update users in mongo for replset %s", replset.Name)
+			defer func() {
+				if err := client.Disconnect(gCtx); err != nil {
+					log.Error(err, "failed to close connection")
+				}
+			}()
+
+			for _, user := range users {
+				if err := user.updateMongo(gCtx, client); err != nil {
+					return errors.Wrapf(err, "update users in mongo for replset %s", replset.Name)
+				}
 			}
-		}
+			return nil
+		})
 	}
 
-	return nil
+	return grp.Wait()
 }
 
-func (u *systemUser) updateMongo(c *mongod.Client) error {
+func (u *systemUser) updateMongo(ctx context.Context, c *mongod.Client) error {
 	if bytes.Equal(u.currName, u.name) {
-		err := mongo.UpdateUserPass(context.TODO(), c, string(u.name), string(u.pass))
+		err := mongo.UpdateUserPass(ctx, c, string(u.name), string(u.pass))
 		return errors.Wrapf(err, "change password for user %s", u.name)
 	}
 
-	err := mongo.UpdateUser(context.TODO(), c, string(u.currName), string(u.name), string(u.pass))
+	err := mongo.UpdateUser(ctx, c, string(u.currName), string(u.name), string(u.pass))
 	return errors.Wrapf(err, "update user %s -> %s", u.currName, u.name)
 }
 

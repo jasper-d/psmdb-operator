@@ -2,7 +2,6 @@ package fs
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +14,14 @@ import (
 
 type Conf struct {
 	Path string `bson:"path" json:"path" yaml:"path"`
+}
+
+func (c *Conf) Cast() error {
+	if c.Path == "" {
+		return errors.New("path can't be empty")
+	}
+
+	return nil
 }
 
 type FS struct {
@@ -30,7 +37,7 @@ func New(opts Conf) *FS {
 func (fs *FS) Save(name string, data io.Reader, _ int) error {
 	filepath := path.Join(fs.opts.Path, name)
 
-	err := os.MkdirAll(path.Dir(filepath), os.ModeDir|0775)
+	err := os.MkdirAll(path.Dir(filepath), os.ModeDir|0700)
 	if err != nil {
 		return errors.Wrapf(err, "create path %s", path.Dir(filepath))
 	}
@@ -39,13 +46,18 @@ func (fs *FS) Save(name string, data io.Reader, _ int) error {
 	if err != nil {
 		return errors.Wrapf(err, "create destination file <%s>", filepath)
 	}
-	err = os.Chmod(filepath, 0664)
+	defer fw.Close()
+	err = os.Chmod(filepath, 0600)
 	if err != nil {
 		return errors.Wrapf(err, "change permissions for file <%s>", filepath)
 	}
 
 	_, err = io.Copy(fw, data)
-	return errors.Wrap(err, "write to file")
+	if err != nil {
+		return errors.Wrapf(err, "copy file <%s>", filepath)
+	}
+
+	return errors.Wrap(fw.Sync(), "write to file")
 }
 
 func (fs *FS) SourceReader(name string) (io.ReadCloser, error) {
@@ -67,16 +79,16 @@ func (fs *FS) FileStat(name string) (inf storage.FileInfo, err error) {
 	inf.Size = f.Size()
 
 	if inf.Size == 0 {
-		return inf, errors.New("file empty")
+		return inf, storage.ErrEmpty
 	}
 
 	return inf, nil
 }
 
-func (fs *FS) List(prefix string) ([]storage.FileInfo, error) {
+func (fs *FS) List(prefix, suffix string) ([]storage.FileInfo, error) {
 	var files []storage.FileInfo
 
-	prefix = path.Join(fs.opts.Path, prefix)
+	prefix = filepath.Join(fs.opts.Path, prefix)
 
 	err := filepath.Walk(prefix, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -94,7 +106,9 @@ func (fs *FS) List(prefix string) ([]storage.FileInfo, error) {
 			if f[0] == '/' {
 				f = f[1:]
 			}
-			files = append(files, storage.FileInfo{Name: f, Size: info.Size()})
+			if strings.HasSuffix(f, suffix) {
+				files = append(files, storage.FileInfo{Name: f, Size: info.Size()})
+			}
 		}
 
 		return nil
@@ -103,28 +117,17 @@ func (fs *FS) List(prefix string) ([]storage.FileInfo, error) {
 	return files, err
 }
 
-func (fs *FS) Files(suffix string) ([][]byte, error) {
-	files, err := ioutil.ReadDir(fs.opts.Path)
+func (fs *FS) Copy(src, dst string) error {
+	from, err := os.Open(path.Join(fs.opts.Path, src))
 	if err != nil {
-		return nil, errors.Wrap(err, "read dir")
+		return errors.Wrap(err, "open src")
 	}
-
-	var bcps [][]byte
-	for _, f := range files {
-		if f.IsDir() || !strings.HasSuffix(f.Name(), suffix) {
-			continue
-		}
-
-		fpath := path.Join(fs.opts.Path, f.Name())
-		data, err := ioutil.ReadFile(fpath)
-		if err != nil {
-			return nil, errors.Wrapf(err, "read file '%s'", fpath)
-		}
-
-		bcps = append(bcps, data)
+	to, err := os.Create(path.Join(fs.opts.Path, dst))
+	if err != nil {
+		return errors.Wrap(err, "create dst")
 	}
-
-	return bcps, nil
+	_, err = io.Copy(to, from)
+	return err
 }
 
 // Delete deletes given file from FS.

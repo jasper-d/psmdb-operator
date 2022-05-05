@@ -3,19 +3,15 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // PerconaServerMongoDBRestoreSpec defines the desired state of PerconaServerMongoDBRestore
 type PerconaServerMongoDBRestoreSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
 	ClusterName  string                            `json:"clusterName,omitempty"`
 	Replset      string                            `json:"replset,omitempty"`
 	BackupName   string                            `json:"backupName,omitempty"`
@@ -39,7 +35,6 @@ const (
 
 // PerconaServerMongoDBRestoreStatus defines the observed state of PerconaServerMongoDBRestore
 type PerconaServerMongoDBRestoreStatus struct {
-	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
 	State          RestoreState `json:"state,omitempty"`
 	PBMname        string       `json:"pbmName,omitempty"`
 	Error          string       `json:"error,omitempty"`
@@ -50,7 +45,13 @@ type PerconaServerMongoDBRestoreStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // PerconaServerMongoDBRestore is the Schema for the perconaservermongodbrestores API
-// +k8s:openapi-gen=true
+//+k8s:openapi-gen=true
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:resource:shortName="psmdb-restore"
+//+kubebuilder:printcolumn:name="Cluster",type=string,JSONPath=".spec.clusterName",description="Cluster name"
+//+kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.state",description="Job status"
+//+kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp",description="Created time"
 type PerconaServerMongoDBRestore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -82,12 +83,12 @@ func (r *PerconaServerMongoDBRestore) CheckFields() error {
 			return errors.New("backupSource destination is required")
 		}
 
-		if r.Spec.BackupSource.Destination[:5] != "s3://" {
+		if r.Spec.BackupSource.S3 != nil && !strings.HasPrefix(r.Spec.BackupSource.Destination, "s3://") {
 			return errors.New("backupSource destination should use s3 protocol format")
 		}
 
-		if len(r.Spec.StorageName) == 0 && r.Spec.BackupSource.S3 == nil {
-			return errors.New("one of storageName or backupSource.s3 is required")
+		if len(r.Spec.StorageName) == 0 && r.Spec.BackupSource.S3 == nil && r.Spec.BackupSource.Azure == nil {
+			return errors.New("one of storageName, backupSource.s3 or backupSource.azure is required")
 		}
 	}
 
@@ -109,21 +110,13 @@ func (r *PerconaServerMongoDBRestore) CheckFields() error {
 	return nil
 }
 
-type PITRestoreSpec struct {
-	Type PITRestoreType  `json:"type,omitempty"`
-	Date *PITRestoreDate `json:"date,omitempty"`
-}
-
-type PITRestoreType string
-
-var (
-	PITRestoreTypeDate   PITRestoreType = "date"
-	PITRestoreTypeLatest PITRestoreType = "latest"
-)
-
+// +kubebuilder:validation:Type=string
 type PITRestoreDate struct {
-	metav1.Time
+	metav1.Time `json:",inline"`
 }
+
+func (PITRestoreDate) OpenAPISchemaType() []string { return []string{"string"} }
+func (PITRestoreDate) OpenAPISchemaFormat() string { return "" }
 
 func (t *PITRestoreDate) UnmarshalJSON(b []byte) (err error) {
 	if len(b) == 4 && string(b) == "null" {
@@ -143,5 +136,18 @@ func (t *PITRestoreDate) UnmarshalJSON(b []byte) (err error) {
 	}
 
 	t.Time = metav1.NewTime(pt.Local())
+
 	return nil
 }
+
+type PITRestoreSpec struct {
+	Type PITRestoreType  `json:"type,omitempty"`
+	Date *PITRestoreDate `json:"date,omitempty"`
+}
+
+type PITRestoreType string
+
+var (
+	PITRestoreTypeDate   PITRestoreType = "date"
+	PITRestoreTypeLatest PITRestoreType = "latest"
+)

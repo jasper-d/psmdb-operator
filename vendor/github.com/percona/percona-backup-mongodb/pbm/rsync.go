@@ -3,16 +3,21 @@ package pbm
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/percona/percona-backup-mongodb/pbm/log"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
 	"github.com/percona/percona-backup-mongodb/version"
 )
 
-const StorInitFile = ".pbm.init"
+const (
+	StorInitFile    = ".pbm.init"
+	PhysRestoresDir = ".pbm.restore"
+)
 
 // ResyncStorage updates PBM metadata (snapshots and pitr) according to the data in the storage
 func (p *PBM) ResyncStorage(l *log.Event) error {
@@ -29,10 +34,39 @@ func (p *PBM) ResyncStorage(l *log.Event) error {
 		return errors.Wrap(err, "init storage")
 	}
 
-	bcps, err := stg.Files(MetadataFileSuffix)
+	rstrs, err := stg.List(PhysRestoresDir, ".json")
 	if err != nil {
 		return errors.Wrap(err, "get a backups list from the storage")
 	}
+	l.Debug("got physical restores list: %v", len(rstrs))
+	for _, rs := range rstrs {
+		src, err := stg.SourceReader(filepath.Join(PhysRestoresDir, rs.Name))
+		if err != nil {
+			return errors.Wrapf(err, "get file %s", rs.Name)
+		}
+
+		rmeta := RestoreMeta{}
+		err = json.NewDecoder(src).Decode(&rmeta)
+		if err != nil {
+			return errors.Wrapf(err, "decode meta %s", rs.Name)
+		}
+
+		_, err = p.Conn.Database(DB).Collection(RestoresCollection).ReplaceOne(
+			p.ctx,
+			bson.D{{"name", rmeta.Name}},
+			rmeta,
+			options.Replace().SetUpsert(true),
+		)
+		if err != nil {
+			return errors.Wrapf(err, "upsert restore %s/%s", rmeta.Name, rmeta.Backup)
+		}
+	}
+
+	bcps, err := stg.List("", MetadataFileSuffix)
+	if err != nil {
+		return errors.Wrap(err, "get a backups list from the storage")
+	}
+	l.Debug("got backups list: %v", len(bcps))
 
 	err = p.moveCollection(BcpCollection, BcpOldCollection)
 	if err != nil {
@@ -49,10 +83,18 @@ func (p *PBM) ResyncStorage(l *log.Event) error {
 
 	var ins []interface{}
 	for _, b := range bcps {
-		v := BackupMeta{}
-		err = json.Unmarshal(b, &v)
+		l.Debug("bcp: %v", b.Name)
+
+		d, err := stg.SourceReader(b.Name)
 		if err != nil {
-			return errors.Wrap(err, "unmarshal backup meta")
+			return errors.Wrapf(err, "read meta for %v", b.Name)
+		}
+
+		v := BackupMeta{}
+		err = json.NewDecoder(d).Decode(&v)
+		d.Close()
+		if err != nil {
+			return errors.Wrapf(err, "unmarshal backup meta [%s]", b.Name)
 		}
 		err = checkBackupFiles(&v, stg)
 		if err != nil {
@@ -66,7 +108,7 @@ func (p *PBM) ResyncStorage(l *log.Event) error {
 		return errors.Wrap(err, "insert retrieved backups meta")
 	}
 
-	pitrf, err := stg.List(PITRfsPrefix)
+	pitrf, err := stg.List(PITRfsPrefix, "")
 	if err != nil {
 		return errors.Wrap(err, "get list of pitr chunks")
 	}
@@ -78,7 +120,7 @@ func (p *PBM) ResyncStorage(l *log.Event) error {
 	for _, f := range pitrf {
 		_, err := stg.FileStat(PITRfsPrefix + "/" + f.Name)
 		if err != nil {
-			l.Warning("skip %s because of %v", f, err)
+			l.Warning("skip pitr chunk %s/%s because of %v", PITRfsPrefix, f.Name, err)
 			continue
 		}
 		chnk := PITRmetaFromFName(f.Name)
@@ -100,6 +142,11 @@ func (p *PBM) ResyncStorage(l *log.Event) error {
 }
 
 func checkBackupFiles(bcp *BackupMeta, stg storage.Storage) error {
+	// !!! TODO: Check physical files ?
+	if bcp.Type == PhysicalBackup {
+		return nil
+	}
+
 	for _, rs := range bcp.Replsets {
 		f, err := stg.FileStat(rs.DumpName)
 		if err != nil {
