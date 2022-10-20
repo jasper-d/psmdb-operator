@@ -44,14 +44,8 @@ RUN find vendor -regextype posix-extended -iregex '.*(license|notice)(\.md|\.txt
             sh -c 'mkdir -pv /licenses/$(echo "$0" | sed -E "s/\/(license|notice).*$//gi") \
                    && cp -v "$0" /licenses/$(echo "$0" | sed -E "s/\/(license|notice).*$//gi")' {} \;
 
-FROM scratch AS webhook
-COPY --from=go_builder /etc/passwd /etc/passwd
-COPY --from=go_builder /etc/group /etc/group
-
+FROM gcr.io/distroless/static-debian11:nonroot AS webhook
 COPY --from=go_builder /usr/local/bin/percona-server-mongodb-webhook /usr/local/bin/percona-server-mongodb-webhook
-
-USER psmdb-user:psmdb-user
-
 ENTRYPOINT ["/usr/local/bin/percona-server-mongodb-webhook"]
 
 FROM registry.access.redhat.com/ubi8/ubi-minimal AS ubi8
