@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/api/admission/v1beta1"
+	v1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,7 +45,7 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 			panic(err2)
 		}
 
-		req := admission.Request{AdmissionRequest: v1beta1.AdmissionRequest{
+		req := admission.Request{AdmissionRequest: v1.AdmissionRequest{
 			UID:       "some-uid",
 			Kind:      metav1.GroupVersionKind{},
 			Resource:  metav1.GroupVersionResource{},
@@ -76,8 +76,6 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 			t.Errorf("expected code %v, actual %v", 400, resp.Result.Status)
 		}
 	})
-
-
 
 	testCases := []struct {
 		name               string
@@ -134,7 +132,7 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 		t.Run(fmt.Sprintf("Add annotation %s", tc.name), func(t *testing.T) {
 			client := fake.NewSimpleClientset()
 			pod, req := setup(tc.annotations, tc.aliases)
-			client.CoreV1().Pods(namespace).Create(pod)
+			client.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 			resp := wh.Handle(context.TODO(), req)
 
 			if !resp.Allowed {
@@ -155,9 +153,9 @@ func TestHostAliasMutator_Handle(t *testing.T) {
 				t.Errorf("expected no err when marshaling patches, got %v", err)
 			}
 
-			patchedPod, err := client.CoreV1().Pods(namespace).Patch(pod.Name, types.JSONPatchType, patchJson)
+			patchedPod, err := client.CoreV1().Pods(namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, patchJson, metav1.PatchOptions{})
 
-			missing := []string{}
+			var missing []string
 			for _, ea := range tc.expectedAliases {
 				for i, aa := range patchedPod.Spec.HostAliases {
 					if ea.IP == aa.IP {
