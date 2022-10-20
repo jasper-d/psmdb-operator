@@ -165,7 +165,7 @@ func GetServiceAddr(ctx context.Context, svc corev1.Service, pod corev1.Pod, cl 
 			addr.Host = svc.Annotations[ExternalDnsAnnotation]
 		} else {
 			var err error = nil
-			addr.Host, err = getIngressPoint(pod, cl)
+			addr.Host, err = getIngressPoint(ctx, pod, cl)
 			if err != nil {
 				return nil, errors.Wrap(err, "get ingress endpoint")
 			}
@@ -296,7 +296,7 @@ func MongoHost(ctx context.Context, cl client.Client, m *api.PerconaServerMongoD
 	return GetAddr(m, pod.Name, rsName), nil
 }
 
-func MongoOwnHost(cl client.Client, m *api.PerconaServerMongoDB, rsName string, rsExposed bool, pod corev1.Pod) (string, error){
+func MongoOwnHost(cl client.Client, m *api.PerconaServerMongoDB, rsName string, rsExposed bool, pod corev1.Pod) (string, error) {
 	return "", nil
 }
 

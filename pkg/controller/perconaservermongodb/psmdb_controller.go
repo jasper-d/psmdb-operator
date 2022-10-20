@@ -392,7 +392,6 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 			return reconcile.Result{}, errors.Errorf("%s is reserved name for config server replset", api.ConfigReplSetName)
 		}
 
-
 		matchLabels := map[string]string{
 			"app.kubernetes.io/name":       "percona-server-mongodb",
 			"app.kubernetes.io/instance":   cr.Name,
@@ -413,7 +412,7 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 			return reconcile.Result{}, errors.Wrap(err, "get pods list for mongos")
 		}
 
-		_, err = r.reconcileStatefulSet(ctx, cr, replset, matchLabels, internalKey)
+		_, err = r.reconcileStatefulSet(ctx, cr, replset, matchLabels, internalKey, replset.Expose.ExternalDnsZone)
 		if err != nil {
 			err = errors.Errorf("reconcile StatefulSet for %s: %v", replset.Name, err)
 			return reconcile.Result{}, err
@@ -440,7 +439,7 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 
 		if replset.NonVoting.Enabled {
 			matchLabels["app.kubernetes.io/component"] = "nonVoting"
-			_, err := r.reconcileStatefulSet(ctx, cr, replset, matchLabels, internalKey)
+			_, err := r.reconcileStatefulSet(ctx, cr, replset, matchLabels, internalKey, replset.Expose.ExternalDnsZone)
 			if err != nil {
 				err = errors.Errorf("reconcile nonVoting StatefulSet for %s: %v", replset.Name, err)
 				return reconcile.Result{}, err
@@ -1449,7 +1448,6 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(
 	if dnsZone != "" {
 		sfsSpec.Template.Annotations[dnsAnnotationKey] = dnsZone
 	}
-
 
 	if cr.CompareVersion("1.8.0") < 0 {
 		sfs, err := r.getRsStatefulset(ctx, cr, replset.Name)
