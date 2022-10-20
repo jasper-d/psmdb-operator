@@ -22,7 +22,7 @@ spec:
   - psmdb-webhook.psmdb.svc
   - psmdb-webhook.psmdb.svc.cluster.local
   issuerRef:
-    name: selfsigned-cluster-issuer
+    name: ca-issuer
     # We can reference ClusterIssuers by changing the kind here.
     # The default value is Issuer (i.e. a locally namespaced Issuer)
     kind: ClusterIssuer

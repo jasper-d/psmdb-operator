@@ -3330,6 +3330,8 @@ spec:
                           type: boolean
                         exposeType:
                           type: string
+                        externalDnsZone:
+                          type: string
                         loadBalancerSourceRanges:
                           items:
                             type: string
@@ -9733,6 +9735,8 @@ spec:
                             type: boolean
                           exposeType:
                             type: string
+                          externalDnsZone:
+                            type: string
                           loadBalancerSourceRanges:
                             items:
                               type: string
@@ -14282,6 +14286,8 @@ spec:
                       expose:
                         properties:
                           exposeType:
+                            type: string
+                          externalDnsZone:
                             type: string
                           loadBalancerSourceRanges:
                             items:

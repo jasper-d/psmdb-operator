@@ -1,9 +1,11 @@
-apiVersion: psmdb.percona.com/v1-8-0
+apiVersion: psmdb.percona.com/v1
 kind: PerconaServerMongoDB
 metadata:
   name: my-cluster-name
   namespace: psmdb
 spec:
+  backup:
+    enabled: false
   crVersion: 1.8.0
   image: percona/percona-server-mongodb:4.4.5-7
   imagePullPolicy: Always
@@ -23,7 +25,6 @@ spec:
 #    mongodParams: --environment=ENVIRONMENT
 #    mongosParams: --environment=ENVIRONMENT
   replsets:
-
   - name: rs0
     size: 3
     affinity:
