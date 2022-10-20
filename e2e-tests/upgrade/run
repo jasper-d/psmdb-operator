@@ -9,7 +9,7 @@ test_dir=$(realpath $(dirname $0))
 cluster='upgrade'
 CLUSTER_SIZE=3
 TARGET_API="${API}"
-TARGET_OPERATOR_VER=$(echo -n "${API//psmdb.percona.com\/v/}" | $sed 's/-/./g')
+TARGET_OPERATOR_VER="${OPERATOR_VERSION}"
 TARGET_IMAGE="${IMAGE}"
 TARGET_IMAGE_MONGOD="${IMAGE_MONGOD}"
 TARGET_IMAGE_PMM="${IMAGE_PMM}"
@@ -102,18 +102,6 @@ function check_applied_images() {
 	esac
 }
 
-function deploy_operator_gh() {
-	desc 'start operator'
-	kubectl_bin apply -f "https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/${GIT_TAG}/deploy/crd.yaml"
-	kubectl_bin apply -f "https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/${GIT_TAG}/deploy/rbac.yaml"
-	curl -s "https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/${GIT_TAG}/deploy/operator.yaml" >"${tmp_dir}/operator_${GIT_TAG}.yaml"
-	$sed -i -e "s^image: .*^image: ${IMAGE}^" "${tmp_dir}/operator_${GIT_TAG}.yaml"
-	kubectl_bin apply -f "${tmp_dir}/operator_${GIT_TAG}.yaml"
-
-	sleep 2
-	wait_pod "$(get_operator_pod)"
-}
-
 function prepare_cr_yaml() {
 	local cr_yaml="$1"
 
@@ -125,8 +113,6 @@ function prepare_cr_yaml() {
 		| yq w - "spec.replsets[*].size" "${CLUSTER_SIZE}" \
 		| yq w - "spec.replsets[*].arbiter.enabled" "false" \
 		| yq w - "spec.backup.enabled" "true" \
-		| yq w - "spec.backup.debug" "true" \
-		| yq w - "spec.backup.restartOnFailure" "true" \
 		| yq w - "spec.backup.pitr.enabled" "false" \
 		| yq w - "spec.backup.storages.minio.type" "s3" \
 		| yq w - "spec.backup.storages.minio.s3.credentialsSecret" "minio-secret" \
@@ -140,11 +126,12 @@ function prepare_cr_yaml() {
 }
 
 function main() {
-	kubectl_bin delete -f "${src_dir}/deploy/crd.yaml" || true
-	kubectl_bin delete -f "${src_dir}/deploy/rbac.yaml" || true
-	create_namespace "${namespace}"
+	rbac="rbac"
+	if [ -n "$OPERATOR_NS" ]; then
+		rbac="cw-rbac"
+	fi
+	create_infra_gh "${namespace}" "${GIT_TAG}"
 	apply_s3_storage_secrets
-	deploy_operator_gh
 	deploy_minio
 
 	curl -s "https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/${GIT_TAG}/deploy/secrets.yaml" >"${tmp_dir}/secrets.yaml"
@@ -176,10 +163,10 @@ function main() {
 
 	desc 'upgrade operator'
 	kubectl_bin apply --server-side --force-conflicts -f "${src_dir}/deploy/crd.yaml"
-	kubectl_bin apply -f "${src_dir}/deploy/rbac.yaml"
+	kubectl_bin apply -f "${src_dir}/deploy/${rbac}.yaml" ${OPERATOR_NS:+-n $OPERATOR_NS}
 	kubectl_bin patch deployment "${OPERATOR_NAME}" \
-		-p'{"spec":{"template":{"spec":{"containers":[{"name":"'"${OPERATOR_NAME}"'","image":"'"${TARGET_IMAGE}"'"}]}}}}'
-	kubectl_bin rollout status deployment/"${OPERATOR_NAME}"
+		-p'{"spec":{"template":{"spec":{"containers":[{"name":"'"${OPERATOR_NAME}"'","image":"'"${TARGET_IMAGE}"'"}]}}}}' ${OPERATOR_NS:+-n $OPERATOR_NS}
+	kubectl_bin rollout status deployment/"${OPERATOR_NAME}" ${OPERATOR_NS:+-n $OPERATOR_NS}
 
 	desc 'wait for operator upgrade'
 	until [[ $(kubectl_bin get pods --selector=name="${OPERATOR_NAME}" \
@@ -226,8 +213,6 @@ function main() {
 	simple_data_check "${cluster}-rs0" "${CLUSTER_SIZE}"
 
 	desc 'cleanup'
-	kubectl_bin delete -f "${src_dir}/deploy/crd.yaml" || :
-	kubectl_bin delete -f "${src_dir}/deploy/rbac.yaml" || :
 	destroy "${namespace}"
 }
 

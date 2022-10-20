@@ -49,7 +49,6 @@ spec:
             - --storageEngine=wiredTiger
             - --relaxPermChecks
             - --sslAllowInvalidCertificates
-            - --sslMode=preferSSL
             - --clusterAuthMode=x509
             - --shardsvr
             - --enableEncryption
@@ -154,14 +153,11 @@ spec:
             - name: DB_PORT_MAX
               value: "30105"
             - name: PMM_USER
-              valueFrom:
-                secretKeyRef:
-                  key: PMM_SERVER_USER
-                  name: internal-monitoring-users
+              value: api_key
             - name: PMM_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  key: PMM_SERVER_PASSWORD
+                  key: PMM_SERVER_API_KEY
                   name: internal-monitoring-users
             - name: POD_NAME
               valueFrom:
@@ -200,21 +196,19 @@ spec:
             - name: PMM_ADMIN_CUSTOM_PARAMS
               value: --environment=dev-mongod
             - name: PMM_AGENT_SERVER_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  key: PMM_SERVER_USER
-                  name: internal-monitoring-users
+              value: api_key
             - name: PMM_AGENT_SERVER_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  key: PMM_SERVER_PASSWORD
+                  key: PMM_SERVER_API_KEY
                   name: internal-monitoring-users
             - name: CLUSTER_NAME
               value: monitoring
             - name: PMM_AGENT_PRERUN_SCRIPT
               value: |-
+                cat /etc/mongodb-ssl/tls.key /etc/mongodb-ssl/tls.crt > /tmp/tls.pem;
                 pmm-admin status --wait=10s;
-                pmm-admin add $(DB_TYPE) $(PMM_ADMIN_CUSTOM_PARAMS) --skip-connection-check --metrics-mode=push  --username=$(DB_USER) --password=$(DB_PASSWORD) --cluster=$(CLUSTER_NAME) --service-name=$(PMM_AGENT_SETUP_NODE_NAME) --host=$(DB_HOST) --port=$(DB_PORT);
+                pmm-admin add $(DB_TYPE) $(PMM_ADMIN_CUSTOM_PARAMS) --skip-connection-check --metrics-mode=push  --username=$(DB_USER) --password=$(DB_PASSWORD) --cluster=$(CLUSTER_NAME) --service-name=$(PMM_AGENT_SETUP_NODE_NAME) --host=$(DB_HOST) --port=$(DB_PORT) --tls --tls-skip-verify --tls-certificate-key-file=/tmp/tls.pem --tls-ca-file=/etc/mongodb-ssl/ca.crt --authentication-mechanism=SCRAM-SHA-1 --authentication-database=admin;
                 pmm-admin annotate --service-name=$(PMM_AGENT_SETUP_NODE_NAME) 'Service restarted'
             - name: PMM_AGENT_SIDECAR
               value: "true"
@@ -257,6 +251,10 @@ spec:
           resources: {}
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /etc/mongodb-ssl
+              name: ssl
+              readOnly: true
       dnsPolicy: ClusterFirst
       initContainers:
         - command:
@@ -269,6 +267,8 @@ spec:
           volumeMounts:
             - mountPath: /data/db
               name: mongod-data
+            - mountPath: /opt/percona
+              name: bin
       restartPolicy: Always
       schedulerName: default-scheduler
       securityContext:
@@ -282,6 +282,8 @@ spec:
             defaultMode: 288
             optional: false
             secretName: monitoring-mongodb-keyfile
+        - emptyDir: {}
+          name: bin
         - configMap:
             defaultMode: 420
             name: monitoring-rs0-mongod

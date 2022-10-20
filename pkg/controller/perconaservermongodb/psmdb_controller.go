@@ -141,8 +141,9 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 }
 
 type CronRegistry struct {
-	crons *cron.Cron
-	jobs  map[string]Shedule
+	crons      *cron.Cron
+	jobs       map[string]Shedule
+	backupJobs *sync.Map
 }
 
 type Shedule struct {
@@ -152,8 +153,9 @@ type Shedule struct {
 
 func NewCronRegistry() CronRegistry {
 	c := CronRegistry{
-		crons: cron.New(),
-		jobs:  make(map[string]Shedule),
+		crons:      cron.New(),
+		jobs:       make(map[string]Shedule),
+		backupJobs: new(sync.Map),
 	}
 
 	c.crons.Start()
@@ -256,6 +258,10 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 			logger.Error(err, "failed to update cluster status", "replset", cr.Spec.Replsets[0].Name)
 		}
 	}()
+
+	if err := r.setCRVersion(ctx, cr); err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "set CR version")
+	}
 
 	err = cr.CheckNSetDefaults(r.serverVersion.Platform, log)
 	if err != nil {
@@ -538,13 +544,13 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 			return reconcile.Result{}, fmt.Errorf("failed to delete orphan PVCs: %v", err)
 		}
 	}
-  
+
 	err = r.exportServices(ctx, cr)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "export services")
 	}
 
-	err = r.sheduleEnsureVersion(ctx, cr, VersionServiceClient{})
+	err = r.scheduleEnsureVersion(ctx, cr, VersionServiceClient{})
 	if err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "failed to ensure version")
 	}
@@ -555,6 +561,23 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(ctx context.Context, request r
 	}
 
 	return rr, nil
+}
+
+func (r *ReconcilePerconaServerMongoDB) setCRVersion(ctx context.Context, cr *api.PerconaServerMongoDB) error {
+	if len(cr.Spec.CRVersion) > 0 {
+		return nil
+	}
+
+	orig := cr.DeepCopy()
+	cr.Spec.CRVersion = version.Version
+
+	if err := r.client.Patch(ctx, cr, client.MergeFrom(orig)); err != nil {
+		return errors.Wrap(err, "patch CR")
+	}
+
+	log.Info("Set CR version", "version", cr.Spec.CRVersion)
+
+	return nil
 }
 
 func (r *ReconcilePerconaServerMongoDB) checkConfiguration(ctx context.Context, cr *api.PerconaServerMongoDB) error {
@@ -758,11 +781,19 @@ func (r *ReconcilePerconaServerMongoDB) deleteCfgIfNeeded(ctx context.Context, c
 		return nil
 	}
 
+	upToDate, err := r.isAllSfsUpToDate(ctx, cr)
+	if err != nil {
+		return errors.Wrap(err, "failed to check is all sfs up to date")
+	}
+
+	if !upToDate {
+		return nil
+	}
+
 	sfsName := cr.Name + "-" + api.ConfigReplSetName
 	sfs := psmdb.NewStatefulSet(sfsName, cr.Namespace)
 
-	err := r.client.Delete(ctx, sfs)
-	if err != nil && !k8serrors.IsNotFound(err) {
+	if err := r.client.Delete(ctx, sfs); err != nil && !k8serrors.IsNotFound(err) {
 		return errors.Wrapf(err, "failed to delete sfs: %s", sfs.Name)
 	}
 
@@ -872,6 +903,15 @@ func (r *ReconcilePerconaServerMongoDB) deleteMongos(ctx context.Context, cr *ap
 
 func (r *ReconcilePerconaServerMongoDB) deleteMongosIfNeeded(ctx context.Context, cr *api.PerconaServerMongoDB) error {
 	if cr.Spec.Sharding.Enabled {
+		return nil
+	}
+
+	upToDate, err := r.isAllSfsUpToDate(ctx, cr)
+	if err != nil {
+		return errors.Wrap(err, "failed to check is all sfs up to date")
+	}
+
+	if !upToDate {
 		return nil
 	}
 
@@ -1144,7 +1184,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileMongos(ctx context.Context, cr 
 			return errors.Wrapf(err, "check pmm secrets: %s", api.UserSecretName(cr))
 		}
 
-		pmmC, err := psmdb.AddPMMContainer(cr, api.UserSecretName(cr), pmmsec, cr.Spec.PMM.MongosParams)
+		pmmC, err := psmdb.AddPMMContainer(cr, &pmmsec, cr.Spec.PMM.MongosParams)
 		if err != nil {
 			return errors.Wrap(err, "failed to create a pmm-client container")
 		}
@@ -1410,11 +1450,6 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(
 		sfsSpec.Template.Annotations[dnsAnnotationKey] = dnsZone
 	}
 
-	for k, v := range sfs.Spec.Template.Annotations {
-		if _, ok := sfsSpec.Template.Annotations[k]; !ok {
-			sfsSpec.Template.Annotations[k] = v
-		}
-	}
 
 	if cr.CompareVersion("1.8.0") < 0 {
 		sfs, err := r.getRsStatefulset(ctx, cr, replset.Name)
@@ -1502,7 +1537,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(
 			if err != nil {
 				return nil, errors.Wrap(err, "check pmm secrets")
 			}
-			pmmC, err := psmdb.AddPMMContainer(cr, api.UserSecretName(cr), pmmsec, cr.Spec.PMM.MongodParams)
+			pmmC, err := psmdb.AddPMMContainer(cr, &pmmsec, cr.Spec.PMM.MongodParams)
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to create a pmm-client container")
 			}

@@ -67,6 +67,21 @@ func Dial(conf *Config) (*mongo.Client, error) {
 	return client, nil
 }
 
+func SetDefaultRWConcern(ctx context.Context, client *mongo.Client, readConcern, writeConcern string) error {
+	cmd := bson.D{
+		{Key: "setDefaultRWConcern", Value: 1},
+		{Key: "defaultReadConcern", Value: bson.D{{Key: "level", Value: readConcern}}},
+		{Key: "defaultWriteConcern", Value: bson.D{{Key: "w", Value: writeConcern}}},
+	}
+
+	res := client.Database("admin").RunCommand(ctx, cmd)
+	if res.Err() != nil {
+		return errors.Wrap(res.Err(), "setDefaultRWConcern")
+	}
+
+	return nil
+}
+
 func ReadConfig(ctx context.Context, client *mongo.Client) (RSConfig, error) {
 	resp := ReplSetGetConfig{}
 	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetConfig", Value: 1}})
@@ -226,8 +241,9 @@ func AddShard(ctx context.Context, client *mongo.Client, rsName, host string) er
 func WriteConfig(ctx context.Context, client *mongo.Client, cfg RSConfig) error {
 	resp := OKResponse{}
 
-	// Using force flag since mongo 4.4 forbids to add multiple members at a time.
-	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetReconfig", Value: cfg}, {Key: "force", Value: true}})
+	log.V(1).Info("Running replSetReconfig config", "cfg", cfg)
+
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetReconfig", Value: cfg}})
 	if res.Err() != nil {
 		return errors.Wrap(res.Err(), "replSetReconfig")
 	}
@@ -531,7 +547,7 @@ func UpdateUser(ctx context.Context, client *mongo.Client, currName, newName, pa
 // It always should leave at least one element. The config won't be valid for mongo otherwise.
 // Better, if the last element has the smallest ID in order not to produce defragmentation
 // when the next element will be added (ID = maxID + 1). Mongo replica set member ID must be between 0 and 255, so it matters.
-func (m *ConfigMembers) RemoveOld(compareWith ConfigMembers) (changes bool) {
+func (m *ConfigMembers) RemoveOld(compareWith ConfigMembers) bool {
 	cm := make(map[string]struct{}, len(compareWith))
 
 	for _, member := range compareWith {
@@ -543,11 +559,11 @@ func (m *ConfigMembers) RemoveOld(compareWith ConfigMembers) (changes bool) {
 		member := []ConfigMember(*m)[i]
 		if _, ok := cm[member.Host]; !ok {
 			*m = append([]ConfigMember(*m)[:i], []ConfigMember(*m)[i+1:]...)
-			changes = true
+			return true
 		}
 	}
 
-	return changes
+	return false
 }
 
 func (m *ConfigMembers) FixHosts(compareWith ConfigMembers) (changes bool) {
@@ -591,6 +607,9 @@ func (m *ConfigMembers) FixTags(compareWith ConfigMembers) (changes bool) {
 	cm := make(map[string]ReplsetTags, len(compareWith))
 
 	for _, member := range compareWith {
+		if member.ArbiterOnly {
+			continue
+		}
 		cm[member.Host] = member.Tags
 	}
 
@@ -623,23 +642,24 @@ func (m *ConfigMembers) ExternalNodesChanged(compareWith ConfigMembers) bool {
 		}{votes: member.Votes, priority: member.Priority}
 	}
 
-	changes := false
 	for i := 0; i < len(*m); i++ {
 		member := []ConfigMember(*m)[i]
 		if ext, ok := cm[member.Host]; ok {
 			if ext.votes != member.Votes || ext.priority != member.Priority {
-				changes = true
+				[]ConfigMember(*m)[i].Votes = ext.votes
+				[]ConfigMember(*m)[i].Priority = ext.priority
+
+				return true
 			}
-			[]ConfigMember(*m)[i].Votes = ext.votes
-			[]ConfigMember(*m)[i].Priority = ext.priority
 		}
 	}
 
-	return changes
+	return false
 }
 
-// AddNew adds new members from given list
-func (m *ConfigMembers) AddNew(from ConfigMembers) (changes bool) {
+// AddNew adds a new member from given list to the config.
+// It adds only one at a time. Returns true if it adds any member.
+func (m *ConfigMembers) AddNew(from ConfigMembers) bool {
 	cm := make(map[string]struct{}, len(*m))
 	lastID := 0
 
@@ -655,15 +675,15 @@ func (m *ConfigMembers) AddNew(from ConfigMembers) (changes bool) {
 			lastID++
 			member.ID = lastID
 			*m = append(*m, member)
-			changes = true
+			return true
 		}
 	}
 
-	return changes
+	return false
 }
 
 // SetVotes sets voting parameters for members list
-func (m *ConfigMembers) SetVotes() {
+func (m *ConfigMembers) SetVotes(unsafePSA bool) {
 	votes := 0
 	lastVoteIdx := -1
 	for i, member := range *m {
@@ -702,7 +722,12 @@ func (m *ConfigMembers) SetVotes() {
 				// We're setting it to 2 as default, to allow
 				// users to configure external nodes with lower
 				// priority than local nodes.
-				[]ConfigMember(*m)[i].Priority = DefaultPriority
+				if !unsafePSA || member.Votes == 1 {
+					// In unsafe PSA (Primary with a Secondary and an Arbiter),
+					// we are unable to set the votes and the priority simultaneously.
+					// Therefore, setting only the votes.
+					[]ConfigMember(*m)[i].Priority = DefaultPriority
+				}
 			}
 		} else if member.ArbiterOnly {
 			// Arbiter should always have a vote

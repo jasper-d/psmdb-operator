@@ -1,8 +1,8 @@
 package v1
 
 import (
-	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -68,7 +68,6 @@ type PerconaServerMongoDBSpec struct {
 	Platform                *version.Platform                    `json:"platform,omitempty"`
 	Image                   string                               `json:"image,omitempty"`
 	ImagePullSecrets        []corev1.LocalObjectReference        `json:"imagePullSecrets,omitempty"`
-	RunUID                  int64                                `json:"runUid,omitempty"`
 	UnsafeConf              bool                                 `json:"allowUnsafeConfigurations,omitempty"`
 	Mongod                  *MongodSpec                          `json:"mongod,omitempty"`
 	Replsets                []*ReplsetSpec                       `json:"replsets,omitempty"`
@@ -186,16 +185,26 @@ func OneOfUpgradeStrategy(a string) bool {
 
 	return us == UpgradeStrategyLatest ||
 		us == UpgradeStrategyRecommended ||
-		us == UpgradeStrategyDiasbled ||
+		us == UpgradeStrategyDisabled ||
 		us == UpgradeStrategyNever
 }
 
 const (
-	UpgradeStrategyDiasbled    UpgradeStrategy = "disabled"
+	UpgradeStrategyDisabled    UpgradeStrategy = "disabled"
 	UpgradeStrategyNever       UpgradeStrategy = "never"
 	UpgradeStrategyRecommended UpgradeStrategy = "recommended"
 	UpgradeStrategyLatest      UpgradeStrategy = "latest"
 )
+
+const DefaultVersionServiceEndpoint = "https://check.percona.com"
+
+func GetDefaultVersionServiceEndpoint() string {
+	if endpoint := os.Getenv("PERCONA_VS_FALLBACK_URI"); len(endpoint) > 0 {
+		return endpoint
+	}
+
+	return DefaultVersionServiceEndpoint
+}
 
 // PerconaServerMongoDBStatus defines the observed state of PerconaServerMongoDB
 type PerconaServerMongoDBStatus struct {
@@ -240,6 +249,23 @@ type PMMSpec struct {
 	MongosParams string `json:"mongosParams,omitempty"`
 
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+const (
+	PMMUserKey     = "PMM_SERVER_USER"
+	PMMPasswordKey = "PMM_SERVER_PASSWORD"
+	PMMAPIKey      = "PMM_SERVER_API_KEY"
+)
+
+func (spec *PMMSpec) ShouldUseAPIKeyAuth(secret *corev1.Secret) bool {
+	if _, ok := secret.Data[PMMAPIKey]; !ok {
+		_, okl := secret.Data[PMMUserKey]
+		_, okp := secret.Data[PMMPasswordKey]
+		if okl && okp {
+			return false
+		}
+	}
+	return true
 }
 
 type MultiAZ struct {
@@ -384,29 +410,50 @@ func (conf MongoConfiguration) IsEncryptionEnabled() (*bool, error) {
 	return &b, nil
 }
 
+// VaultEnabled returns whether mongo config has vault section under security
+func (conf MongoConfiguration) VaultEnabled() bool {
+	m, err := conf.GetOptions("security")
+	if err != nil || m == nil {
+		return false
+	}
+	_, ok := m["vault"]
+	return ok
+}
+
 // setEncryptionDefaults sets encryptionKeyFile to a default value if enableEncryption is specified.
 func (conf *MongoConfiguration) setEncryptionDefaults() error {
 	m := make(map[string]interface{})
+
 	err := yaml.Unmarshal([]byte(*conf), m)
 	if err != nil {
 		return err
 	}
+
 	val, ok := m["security"]
 	if !ok {
 		return nil
 	}
+
 	security, ok := val.(map[interface{}]interface{})
 	if !ok {
 		return errors.New("security configuration section is invalid")
 	}
+
+	if _, ok := security["vault"]; ok {
+		return nil
+	}
+
 	if _, ok = security["enableEncryption"]; ok {
 		security["encryptionKeyFile"] = MongodRESTencryptDir + "/" + EncryptionKeyName
 	}
+
 	res, err := yaml.Marshal(m)
 	if err != nil {
 		return err
 	}
+
 	*conf = MongoConfiguration(res)
+
 	return nil
 }
 
@@ -490,6 +537,7 @@ type SecretsSpec struct {
 	SSL           string `json:"ssl,omitempty"`
 	SSLInternal   string `json:"sslInternal,omitempty"`
 	EncryptionKey string `json:"encryptionKey,omitempty"`
+	Vault         string `json:"vault,omitempty"`
 }
 
 type MongosSpec struct {
@@ -652,6 +700,10 @@ type BackupTaskSpec struct {
 	CompressionLevel *int                `json:"compressionLevel,omitempty"`
 }
 
+func (task *BackupTaskSpec) JobName(cr *PerconaServerMongoDB) string {
+	return cr.Name + "-backup-" + task.Name
+}
+
 type BackupStorageS3Spec struct {
 	Bucket                string `json:"bucket"`
 	Prefix                string `json:"prefix,omitempty"`
@@ -733,6 +785,7 @@ type MongosExpose struct {
 	ServicePerPod            bool               `json:"servicePerPod,omitempty"`
 	LoadBalancerSourceRanges []string           `json:"loadBalancerSourceRanges,omitempty"`
 	ServiceAnnotations       map[string]string  `json:"serviceAnnotations,omitempty"`
+	ServiceLabels            map[string]string  `json:"serviceLabels,omitempty"`
 }
 
 type Expose struct {
@@ -741,6 +794,7 @@ type Expose struct {
 	LoadBalancerSourceRanges []string           `json:"loadBalancerSourceRanges,omitempty"`
 	ExternalDnsZone          string             `json:"externalDnsZone,omitempty"`
 	ServiceAnnotations       map[string]string  `json:"serviceAnnotations,omitempty"`
+	ServiceLabels            map[string]string  `json:"serviceLabels,omitempty"`
 }
 
 // ServerVersion represents info about k8s / openshift server version
@@ -767,41 +821,11 @@ func (cr *PerconaServerMongoDB) OwnerRef(scheme *runtime.Scheme) (metav1.OwnerRe
 	}, nil
 }
 
-// setVersion sets the API version of a PSMDB resource.
-// The new (semver-matching) version is determined either by the CR's API version or an API version specified via the CR's annotations.
-// If the CR's API version is an empty string, it returns "v1"
-func (cr *PerconaServerMongoDB) setVersion() error {
-	if len(cr.Spec.CRVersion) > 0 {
-		return nil
-	}
-
-	apiVersion := version.Version
-
-	if lastCR, ok := cr.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; ok {
-		var newCR PerconaServerMongoDB
-		err := json.Unmarshal([]byte(lastCR), &newCR)
-		if err != nil {
-			return err
-		}
-		if len(newCR.APIVersion) > 0 {
-			apiVersion = strings.Replace(strings.TrimPrefix(newCR.APIVersion, "psmdb.percona.com/v"), "-", ".", -1)
-		}
-	}
-
-	cr.Spec.CRVersion = apiVersion
-
-	return nil
-}
-
 func (cr *PerconaServerMongoDB) Version() *v.Version {
 	return v.Must(v.NewVersion(cr.Spec.CRVersion))
 }
 
 func (cr *PerconaServerMongoDB) CompareVersion(version string) int {
-	if len(cr.Spec.CRVersion) == 0 {
-		cr.setVersion()
-	}
-
 	// using Must because "version" must be right format
 	return cr.Version().Compare(v.Must(v.NewVersion(version)))
 }

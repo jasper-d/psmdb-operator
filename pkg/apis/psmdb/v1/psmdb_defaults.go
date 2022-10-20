@@ -35,7 +35,6 @@ const (
 )
 
 var (
-	defaultRunUID                   int64 = 1001
 	defaultUsersSecretName                = "percona-server-mongodb-users"
 	defaultMongodSize               int32 = 3
 	defaultReplsetName                    = "rs"
@@ -56,11 +55,6 @@ const (
 // CheckNSetDefaults sets default options, overwrites wrong settings
 // and checks if other options' values valid
 func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log logr.Logger) error {
-	err := cr.setVersion()
-	if err != nil {
-		return errors.Wrap(err, "set version")
-	}
-
 	if cr.Spec.Replsets == nil {
 		return errors.New("at least one replica set should be specified")
 	}
@@ -461,10 +455,6 @@ func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log
 		}
 	}
 
-	if cr.Spec.RunUID == 0 && platform != version.PlatformOpenshift {
-		cr.Spec.RunUID = defaultRunUID
-	}
-
 	// there is shouldn't be any backups while pause
 	if cr.Spec.Pause {
 		cr.Spec.Backup.Enabled = false
@@ -533,6 +523,14 @@ func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log
 
 	if cr.Spec.Unmanaged && cr.Spec.UpdateStrategy == SmartUpdateStatefulSetStrategyType {
 		return errors.New("SmartUpdate is not allowed on unmanaged clusters, set updateStrategy to RollingUpdate or OnDelete")
+	}
+
+	if cr.Spec.UpgradeOptions.VersionServiceEndpoint == "" {
+		cr.Spec.UpgradeOptions.VersionServiceEndpoint = DefaultVersionServiceEndpoint
+	}
+
+	if cr.Spec.UpgradeOptions.Apply == "" {
+		cr.Spec.UpgradeOptions.Apply = UpgradeStrategyDisabled
 	}
 
 	if len(cr.Spec.MultiCluster.DNSSuffix) == 0 {

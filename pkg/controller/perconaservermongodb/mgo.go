@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,9 +40,12 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		return api.AppStateReady, nil
 	}
 
+	// Primary with a Secondary and an Arbiter (PSA)
+	unsafePSA := cr.Spec.UnsafeConf && replset.Arbiter.Enabled && replset.Arbiter.Size == 1 && !replset.NonVoting.Enabled && replset.Size == 2
+
 	// all pods needs to be scheduled to reconcile
 	if int(replsetSize) > len(pods.Items) {
-		log.Info("Waiting for the pods", "replsetSize", replsetSize, "pods", len(pods.Items))
+		log.Info("Waiting for the pods", "replset", replset.Name, "size", replsetSize, "pods", len(pods.Items))
 		return api.AppStateInit, nil
 	}
 
@@ -68,12 +72,11 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		}
 	}
 
-	if cr.Spec.Unmanaged {
-		return api.AppStateReady, nil
-	}
-
 	cli, err := r.mongoClientWithRole(ctx, cr, *replset, roleClusterAdmin)
 	if err != nil {
+		if cr.Spec.Unmanaged {
+			return api.AppStateInit, nil
+		}
 		if cr.Status.Replsets[replset.Name].Initialized {
 			// If an exposed replset is initialized but connection fails with ReplicaSetNoPrimary,
 			// we'll change the member hosts to local FQDNs and reconfig to recover.
@@ -116,6 +119,17 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		})
 
 		return api.AppStateInit, nil
+	}
+
+	if cr.Spec.Unmanaged {
+		status, err := mongo.RSStatus(ctx, cli)
+		if err != nil {
+			return api.AppStateError, errors.Wrap(err, "failed to get rs status")
+		}
+		if status.Primary() == nil {
+			return api.AppStateInit, nil
+		}
+		return api.AppStateReady, nil
 	}
 	err = r.createOrUpdateSystemUsers(ctx, cr, replset)
 	if err != nil {
@@ -170,6 +184,12 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 			}
 		}()
 
+		err = mongo.SetDefaultRWConcern(ctx, mongosSession, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
+		// SetDefaultRWConcern introduced in MongoDB 4.4
+		if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
+			return api.AppStateError, errors.Wrap(err, "set default RW concern")
+		}
+
 		in, err := inShard(ctx, mongosSession, replset.Name)
 		if err != nil {
 			return api.AppStateError, errors.Wrap(err, "get shard")
@@ -191,6 +211,14 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		rs.AddedAsShard = &t
 		cr.Status.Replsets[replset.Name] = rs
 
+	}
+
+	if replset.Arbiter.Enabled && !cr.Spec.Sharding.Enabled {
+		err := mongo.SetDefaultRWConcern(ctx, cli, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
+		// SetDefaultRWConcern introduced in MongoDB 4.4
+		if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
+			return api.AppStateError, errors.Wrap(err, "set default RW concern")
+		}
 	}
 
 	cnf, err := mongo.ReadConfig(ctx, cli)
@@ -215,6 +243,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 			Host:         host,
 			BuildIndexes: true,
 			Priority:     mongo.DefaultPriority,
+			Votes:        mongo.DefaultVotes,
 		}
 
 		switch pod.Labels["app.kubernetes.io/component"] {
@@ -237,6 +266,11 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		members = append(members, member)
 	}
 
+	// sort config members by priority, descending
+	sort.Slice(members, func(i, j int) bool {
+		return members[i].Priority > members[j].Priority
+	})
+
 	memberC := len(members)
 	for i, extNode := range replset.ExternalNodes {
 		if i+memberC >= mongo.MaxMembers {
@@ -257,9 +291,10 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	}
 
 	if cnf.Members.FixTags(members) {
-		cnf.Members.SetVotes()
-
 		cnf.Version++
+
+		log.Info("Fixing member tags", "replset", replset.Name)
+
 		if err := mongo.WriteConfig(ctx, cli, cnf); err != nil {
 			return api.AppStateError, errors.Wrap(err, "fix tags: write mongo config")
 		}
@@ -268,6 +303,8 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	if cnf.Members.FixHosts(members) {
 		cnf.Version++
 
+		log.Info("Fixing member hosts", "replset", replset.Name)
+
 		err = mongo.WriteConfig(ctx, cli, cnf)
 		if err != nil {
 			return api.AppStateError, errors.Wrap(err, "fix hosts: write mongo config")
@@ -275,9 +312,9 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	}
 
 	if cnf.Members.RemoveOld(members) {
-		cnf.Members.SetVotes()
-
 		cnf.Version++
+
+		log.Info("Removing old nodes", "replset", replset.Name)
 
 		err = mongo.WriteConfig(ctx, cli, cnf)
 		if err != nil {
@@ -285,15 +322,38 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		}
 	}
 
-	if cnf.Members.AddNew(members) || cnf.Members.ExternalNodesChanged(members) {
-		cnf.Members.RemoveOld(members)
-		cnf.Members.SetVotes()
-
+	if cnf.Members.AddNew(members) {
 		cnf.Version++
+
+		log.Info("Adding new nodes", "replset", replset.Name)
 
 		err = mongo.WriteConfig(ctx, cli, cnf)
 		if err != nil {
 			return api.AppStateError, errors.Wrap(err, "add new: write mongo config")
+		}
+	}
+
+	if cnf.Members.ExternalNodesChanged(members) {
+		cnf.Version++
+
+		log.Info("Updating external nodes", "replset", replset.Name)
+
+		err = mongo.WriteConfig(ctx, cli, cnf)
+		if err != nil {
+			return api.AppStateError, errors.Wrap(err, "update external nodes: write mongo config")
+		}
+	}
+
+	currMembers := append(mongo.ConfigMembers(nil), cnf.Members...)
+	cnf.Members.SetVotes(unsafePSA)
+	if !reflect.DeepEqual(currMembers, cnf.Members) {
+		cnf.Version++
+
+		log.Info("Configuring member votes and priorities", "replset", replset.Name)
+
+		err = mongo.WriteConfig(ctx, cli, cnf)
+		if err != nil {
+			return api.AppStateError, errors.Wrap(err, "set votes: write mongo config")
 		}
 	}
 
@@ -433,11 +493,10 @@ func (r *ReconcilePerconaServerMongoDB) handleRsAddToShard(ctx context.Context, 
 	return nil
 }
 
-// handleReplsetInit runs the k8s-mongodb-initiator from within the first running pod's mongod container.
+// handleReplsetInit initializes the replset within the first running pod's mongod container.
 // This must be ran from within the running container to utilize the MongoDB Localhost Exception.
 //
-// See: https://docs.mongodb.com/manual/core/security-users/#localhost-exception
-//
+// See: https://www.mongodb.com/docs/manual/core/localhost-exception/
 func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, pods []corev1.Pod) error {
 	for _, pod := range pods {
 		if !isMongodPod(pod) || !isContainerAndPodRunning(pod, "mongod") || !isPodReady(pod) {
@@ -452,11 +511,16 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m
 		}
 		var errb, outb bytes.Buffer
 
-		cmd := []string{"sh", "-c", ""}
+		mongoCmd := "mongo"
+		if !m.Spec.UnsafeConf {
+			mongoCmd += " --tls --tlsCertificateKeyFile /tmp/tls.pem --tlsAllowInvalidCertificates --tlsCAFile /etc/mongodb-ssl/ca.crt"
+		}
 
-		cmd[2] = fmt.Sprintf(
-			`
-				cat <<-EOF | mongo 
+		cmd := []string{
+			"sh", "-c",
+			fmt.Sprintf(
+				`
+				cat <<-EOF | %s 
 				rs.initiate(
 					{
 						_id: '%s',
@@ -467,7 +531,11 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m
 					}
 				)
 				EOF
-			`, replset.Name, host)
+			`, mongoCmd, replset.Name, host),
+		}
+
+		errb.Reset()
+		outb.Reset()
 		err = r.clientcmd.Exec(&pod, "mongod", cmd, nil, &outb, &errb, false)
 		if err != nil {
 			return fmt.Errorf("exec rs.initiate: %v / %s / %s", err, outb.String(), errb.String())
@@ -480,7 +548,7 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m
 			return errors.Wrap(err, "failed to get userAdmin credentials")
 		}
 
-		cmd[2] = fmt.Sprintf(`mongo --eval %s`, mongoInitAdminUser(userAdmin.Username, userAdmin.Password))
+		cmd[2] = fmt.Sprintf(`%s --eval %s`, mongoCmd, mongoInitAdminUser(userAdmin.Username, userAdmin.Password))
 		errb.Reset()
 		outb.Reset()
 		err = r.clientcmd.Exec(&pod, "mongod", cmd, nil, &outb, &errb, false)
@@ -488,7 +556,7 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m
 			return fmt.Errorf("exec add admin user: %v / %s / %s", err, outb.String(), errb.String())
 		}
 
-		log.Info("replset was initialized", "replset", replset.Name, "pod", pod.Name)
+		log.Info("replset initialized", "replset", replset.Name, "pod", pod.Name)
 
 		return nil
 	}
@@ -499,6 +567,15 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, m
 func getRoles(cr *api.PerconaServerMongoDB, role UserRole) []map[string]interface{} {
 	roles := make([]map[string]interface{}, 0)
 	switch role {
+	case roleDatabaseAdmin:
+		return []map[string]interface{}{
+			{"role": "readWriteAnyDatabase", "db": "admin"},
+			{"role": "readAnyDatabase", "db": "admin"},
+			{"role": "restore", "db": "admin"},
+			{"role": "backup", "db": "admin"},
+			{"role": "dbAdminAnyDatabase", "db": "admin"},
+			{"role": string(roleClusterMonitor), "db": "admin"},
+		}
 	case roleClusterMonitor:
 		if cr.CompareVersion("1.12.0") >= 0 {
 			roles = []map[string]interface{}{
@@ -633,10 +710,16 @@ func (r *ReconcilePerconaServerMongoDB) createOrUpdateSystemUsers(ctx context.Co
 		return errors.Wrap(err, "create or update system role")
 	}
 
-	for _, role := range []UserRole{roleClusterAdmin, roleClusterMonitor, roleBackup} {
+	users := []UserRole{roleClusterAdmin, roleClusterMonitor, roleBackup}
+	if cr.CompareVersion("1.13.0") >= 0 {
+		users = append(users, roleDatabaseAdmin)
+	}
+
+	for _, role := range users {
 		creds, err := r.getInternalCredentials(ctx, cr, role)
 		if err != nil {
-			return errors.Wrapf(err, "failed to get credentials for %s", role)
+			log.Error(err, "failed to get credentials", "role", role)
+			continue
 		}
 		user, err := mongo.GetUserInfo(ctx, cli, creds.Username)
 		if err != nil {

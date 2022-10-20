@@ -1,4 +1,4 @@
-FROM golang:1.17 AS go_builder
+FROM golang:1.19 AS go_builder
 WORKDIR /go/src/github.com/percona/percona-server-mongodb-operator
 
 COPY . .
@@ -69,6 +69,7 @@ COPY LICENSE /licenses/
 COPY --from=go_builder /usr/local/bin/mongodb-healthcheck /mongodb-healthcheck
 COPY build/init-entrypoint.sh /init-entrypoint.sh
 COPY build/ps-entry.sh /ps-entry.sh
+COPY build/pbm-entry.sh /pbm-entry.sh
 # Mozilla licensed source code should be included
 COPY vendor/github.com/hashicorp /lib
 

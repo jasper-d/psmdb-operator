@@ -1,4 +1,4 @@
-apiVersion: psmdb.percona.com/v1-12-0
+apiVersion: psmdb.percona.com/v1
 kind: PerconaServerMongoDB
 metadata:
   name: my-cluster-name
@@ -11,15 +11,14 @@ spec:
 #  clusterServiceDNSMode: "Internal"
 #  pause: true
 #  unmanaged: false
-  crVersion: 1.12.0
-  image: percona/percona-server-mongodb:5.0.7-6
+  crVersion: 1.14.0
+  image: percona/percona-server-mongodb:5.0.11-10
   imagePullPolicy: Always
 #  tls:
 #    # 90 days in hours
 #    certValidityDuration: 2160h
 #  imagePullSecrets:
 #    - name: private-registry-credentials
-#  runUid: 1001
   allowUnsafeConfigurations: false
   updateStrategy: SmartUpdate
 #  multiCluster:
@@ -27,15 +26,16 @@ spec:
 #    DNSSuffix: svc.clusterset.local
   upgradeOptions:
     versionServiceEndpoint: https://check.percona.com
-    apply: 5.0-recommended
+    apply: disabled
     schedule: "0 2 * * *"
     setFCV: false
   secrets:
     users: my-cluster-name-secrets
     encryptionKey: my-cluster-name-mongodb-encryption-key
+#    vault: my-cluster-name-vault
   pmm:
     enabled: false
-    image: percona/pmm-client:2.27.0
+    image: percona/pmm-client:2.30.0
     serverHost: monitoring-service
 #    mongodParams: --environment=ENVIRONMENT
 #    mongosParams: --environment=ENVIRONMENT
@@ -52,6 +52,9 @@ spec:
 #    - host: 34.124.76.92
 #    # for more configuration fields refer to https://docs.mongodb.com/manual/reference/configuration-options/
 #    configuration: |
+#      net:
+#        tls:
+#          mode: preferTLS
 #      operationProfiling:
 #        mode: slowOp
 #      systemLog:
@@ -158,6 +161,8 @@ spec:
 #        - 10.0.0.0/8
 #      serviceAnnotations:
 #        service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
+#      serviceLabels:
+#        rack: rack-22
     resources:
       limits:
         cpu: "300m"
@@ -330,6 +335,8 @@ spec:
 #          - 10.0.0.0/8
 #        serviceAnnotations:
 #          service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
+#        serviceLabels:
+#          rack: rack-22
       resources:
         limits:
           cpu: "300m"
@@ -413,10 +420,8 @@ spec:
 #          - 10.0.0.0/8
 #        serviceAnnotations:
 #          service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
-#      auditLog:
-#        destination: file
-#        format: BSON
-#        filter: '{}'
+#        serviceLabels:
+#          rack: rack-22
 
 #  mongod:
 #    security:
@@ -424,7 +429,7 @@ spec:
 
   backup:
     enabled: true
-    image: percona/percona-backup-mongodb:1.7.0
+    image: perconalab/percona-server-mongodb-operator:main-backup
     serviceAccountName: percona-server-mongodb-operator
 #    annotations:
 #      iam.amazonaws.com/role: role-arn

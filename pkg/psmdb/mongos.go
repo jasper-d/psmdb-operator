@@ -2,12 +2,12 @@ package psmdb
 
 import (
 	"fmt"
-	"github.com/go-logr/logr"
-	appsv1 "k8s.io/api/apps/v1"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -148,7 +148,17 @@ func InitContainers(cr *api.PerconaServerMongoDB, initImage string) []corev1.Con
 			image = initImage
 		}
 	}
-	return []corev1.Container{EntrypointInitContainer(image, cr.Spec.ImagePullPolicy)}
+
+	initContainer := EntrypointInitContainer(image, cr.Spec.ImagePullPolicy)
+
+	if cr.CompareVersion("1.13.0") >= 0 {
+		initContainer.VolumeMounts = append(initContainer.VolumeMounts, corev1.VolumeMount{
+			Name:      BinVolumeName,
+			MountPath: BinMountPath,
+		})
+	}
+
+	return []corev1.Container{initContainer}
 }
 
 func mongosContainer(cr *api.PerconaServerMongoDB, useConfigFile bool, cfgInstances []string) (corev1.Container, error) {
@@ -166,7 +176,7 @@ func mongosContainer(cr *api.PerconaServerMongoDB, useConfigFile bool, cfgInstan
 		},
 		{
 			Name:      "ssl",
-			MountPath: sslDir,
+			MountPath: SSLDir,
 			ReadOnly:  true,
 		},
 		{
@@ -272,10 +282,10 @@ func mongosContainerArgs(cr *api.PerconaServerMongoDB, resources corev1.Resource
 			"--keyFile="+mongodSecretsDir+"/mongodb-key",
 		)
 	} else {
-		args = append(args,
-			"--sslMode=preferSSL",
-			"--clusterAuthMode=x509",
-		)
+		if cr.CompareVersion("1.12.0") <= 0 {
+			args = append(args, "--sslMode=preferSSL")
+		}
+		args = append(args, "--clusterAuthMode=x509")
 	}
 
 	if cr.CompareVersion("1.12.0") < 0 && mdSpec.Security != nil && mdSpec.Security.RedactClientLogData {
@@ -291,7 +301,7 @@ func mongosContainerArgs(cr *api.PerconaServerMongoDB, resources corev1.Resource
 		}
 	}
 
-	if msSpec.AuditLog != nil && msSpec.AuditLog.Destination == api.AuditLogDestinationFile {
+	if cr.CompareVersion("1.13.0") < 0 && msSpec.AuditLog != nil && msSpec.AuditLog.Destination == api.AuditLogDestinationFile {
 		if msSpec.AuditLog.Filter == "" {
 			msSpec.AuditLog.Filter = "{}"
 		}
@@ -390,6 +400,15 @@ func volumes(cr *api.PerconaServerMongoDB, configSource VolumeSourceType) []core
 		})
 	}
 
+	if cr.CompareVersion("1.13.0") >= 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: BinVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+	}
+
 	return volumes
 }
 
@@ -408,12 +427,13 @@ func MongosService(cr *api.PerconaServerMongoDB, name string) corev1.Service {
 		svc.Labels = mongosLabels(cr)
 	}
 
-	if cr.CompareVersion("1.12.0") >= 0 {
-		svc.Labels = mongosLabels(cr)
-	}
-
 	if cr.Spec.Sharding.Mongos != nil {
 		svc.Annotations = cr.Spec.Sharding.Mongos.Expose.ServiceAnnotations
+		for k, v := range cr.Spec.Sharding.Mongos.Expose.ServiceLabels {
+			if _, ok := svc.Labels[k]; !ok {
+				svc.Labels[k] = v
+			}
+		}
 	}
 
 	return svc
