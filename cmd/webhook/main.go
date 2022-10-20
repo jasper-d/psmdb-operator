@@ -3,11 +3,10 @@ package main
 import (
 	"fmt"
 	wh "github.com/percona/percona-server-mongodb-operator/pkg/webhook"
-	"os"
+	"k8s.io/klog/v2"
 	"runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -20,26 +19,24 @@ var (
 )
 
 func printVersion() {
-	log.Info(fmt.Sprintf("Git commit: %s Git branch: %s", GitCommit, GitBranch))
-	log.Info(fmt.Sprintf("Go Version: %s", runtime.Version()))
-	log.Info(fmt.Sprintf("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH))
+	klog.Info(fmt.Sprintf("Git commit: %s Git branch: %s", GitCommit, GitBranch))
+	klog.Info(fmt.Sprintf("Go Version: %s", runtime.Version()))
+	klog.Info(fmt.Sprintf("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH))
 }
 
 func main() {
-	ctrl.SetLogger(zap.New())
+	klog.InitFlags(nil)
 	printVersion()
 
 	cfg, err := config.GetConfig()
 	if err != nil {
-		log.Error(err, "")
-		os.Exit(1)
+		klog.Exit(err)
 	}
 
 	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
 
 	if err != nil {
-		log.Error(err, "")
-		os.Exit(1)
+		klog.Exit(err)
 	}
 
 	hookServer := mgr.GetWebhookServer()
@@ -48,7 +45,6 @@ func main() {
 	hookServer.Register("/host-alias-mutator", &webhook.Admission{Handler: &wh.HostAliasMutator{}})
 
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
-		log.Error(err, "manager exited non-zero")
-		os.Exit(1)
+		klog.Exit(err)
 	}
 }
